@@ -1,8 +1,10 @@
 .venv/
 node_modules/
+frontend/dist/
 __pycache__/
 .pytest_cache/
 .env
 .env.*
 *.pem
 *.key
+server/data/
