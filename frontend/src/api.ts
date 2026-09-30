@@ -1,13 +1,12 @@
-import type { EnqueueResult, ReplayResult, RoomInfo, SnapshotEvent } from './types';
+import type { Command, EnqueueResult, QueuedInput, ReplayResult, RoomInfo, SnapshotEvent } from './types';
 
 export interface ChaosConfig {
 	// Delay range (ms) applied to every POST before it leaves the client.
 	delayMs: number;
 	// Probability in [0,1] that an input is delivered twice.
 	duplicateRate: number;
-	// When true, the client simulates a short disconnect: POSTs are held and
-	// the event stream is torn down, then everything reconnects/resumes.
-	blinkMs: number;
+	// Duration (ms) of the next manual "simulate disconnect" drill.
+	blinkMs?: number;
 }
 
 export const defaultChaos: ChaosConfig = { delayMs: 0, duplicateRate: 0, blinkMs: 0 };
@@ -36,8 +35,14 @@ export class GameClient {
 	chaos: ChaosConfig = { ...defaultChaos };
 
 	private blinkUntil = 0;
+	private reconnectAt = 0;
 	private listeners = new Set<(ev: SnapshotEvent) => void>();
 	private statusListeners = new Set<(status: TransportStatus) => void>();
+	private queueListeners = new Set<(q: QueuedInput[]) => void>();
+	// queued: inputs issued while the link is down. They remain observable
+	// for the whole blackout and are flushed in seq order on reconnect;
+	// nothing is ever optimistically retried by the transport.
+	queued: QueuedInput[] = [];
 	es: EventSource | null = null;
 	lastEventId = -1;
 	transport: TransportStatus = 'connecting';
@@ -53,25 +58,76 @@ export class GameClient {
 	// via onDuplicate so the UI can show the server's stale ack.
 	async sendInput(
 		seq: number,
-		cmd: string,
+		cmd: Command,
 		onDuplicate?: (status: number, result: EnqueueResult) => void,
 	): Promise<{ status: number; result: EnqueueResult | null; heldMs: number }> {
 		const body = { sessionId: this.sessionId, charId: this.charId, seq, cmd };
+		// If the link is already down (or goes down while the input is in
+		// flight), the POST is held locally: the input stays visible in the
+		// pending/queued UI until the stream resumes, then it is sent exactly
+		// once with its original seq.
+		if (this.transport === 'disconnected' || this.transport === 'reconnecting') {
+			return this.holdUntilOnline(seq, cmd, body, onDuplicate);
+		}
 		const heldMs = await this.weatherBlackout();
+		if (heldMs > 0) {
+			// Blackout started while this call was queued behind the delay:
+			// join the observable queue instead of racing the resumed stream.
+			if (this.transport !== 'online') {
+				return this.holdUntilOnline(seq, cmd, body, onDuplicate);
+			}
+			return this.flushOne(body, onDuplicate, heldMs);
+		}
 		if (this.chaos.delayMs > 0) {
 			await sleep(this.chaos.delayMs);
 		}
+		return this.flushOne(body, onDuplicate, heldMs);
+	}
+
+	private async flushOne(
+		body: { sessionId: string; charId: string; seq: number; cmd: Command },
+		onDuplicate: ((status: number, result: EnqueueResult) => void) | undefined,
+		heldMs: number,
+	): Promise<{ status: number; result: EnqueueResult | null; heldMs: number }> {
 		const primary = postJSON(`/api/rooms/${this.roomId}/inputs`, body);
 		let duplicate: Promise<void> | null = null;
 		if (this.chaos.duplicateRate > 0 && Math.random() < this.chaos.duplicateRate) {
-		duplicate = sleep(Math.max(120, this.chaos.delayMs + 200)).then(async () => {
-			const d = await postJSON(`/api/rooms/${this.roomId}/inputs`, body);
-			onDuplicate?.(d.status, d.json as EnqueueResult);
-		});
+			duplicate = sleep(Math.max(120, this.chaos.delayMs + 200)).then(async () => {
+				const d = await postJSON(`/api/rooms/${this.roomId}/inputs`, body);
+				onDuplicate?.(d.status, d.json as EnqueueResult);
+			});
 		}
 		const { status, json } = await primary;
 		await duplicate;
 		return { status, result: json as EnqueueResult, heldMs };
+	}
+
+	private holdUntilOnline(
+		seq: number,
+		cmd: Command,
+		body: { sessionId: string; charId: string; seq: number; cmd: Command },
+		onDuplicate?: (status: number, result: EnqueueResult) => void,
+	): Promise<{ status: number; result: EnqueueResult | null; heldMs: number }> {
+		const item: QueuedInput = { seq, cmd, queuedAt: Date.now() };
+		this.queued = [...this.queued, item];
+		this.emitQueue();
+		return new Promise((resolve, reject) => {
+			const wait = () => {
+				// Inputs are released only after the resumed stream is open,
+				// so the ack/snapshot that confirms them is observable in
+				// order. The scheduled reconnect time is only a backstop.
+				const remain = this.reconnectAt - Date.now();
+				if (this.transport !== 'online') {
+					setTimeout(wait, Math.max(50, Math.min(250, Math.max(0, remain) || 200)));
+					return;
+				}
+				this.queued = this.queued.filter((q) => q.seq !== seq);
+				this.emitQueue();
+				const heldMs = Date.now() - item.queuedAt;
+				this.flushOne(body, onDuplicate, heldMs).then(resolve, reject);
+			};
+			wait();
+		});
 	}
 
 	private async weatherBlackout(): Promise<number> {
@@ -85,13 +141,25 @@ export class GameClient {
 	// startBlink tears down SSE for blinkMs and holds outgoing POSTs, then the
 	// stream resumes from the last event id (no inputs are re-run by server).
 	startBlink(ms: number) {
-		this.blinkUntil = Date.now() + ms;
+		const until = Date.now() + ms;
+		this.blinkUntil = until;
+		this.reconnectAt = until;
 		this.setTransport('disconnected');
 		this.closeStream();
 		setTimeout(() => {
+			if (this.blinkUntil !== until) return; // a newer drill superseded
 			this.blinkUntil = 0;
-			this.connectStream();
+			if (!this.es) this.connectStream();
 		}, ms);
+	}
+
+	onQueue(fn: (q: QueuedInput[]) => void): () => void {
+		this.queueListeners.add(fn);
+		fn(this.queued);
+		return () => this.queueListeners.delete(fn);
+	}
+	private emitQueue() {
+		this.queueListeners.forEach((fn) => fn(this.queued));
 	}
 
 	onEvent(fn: (ev: SnapshotEvent) => void): () => void {
@@ -113,8 +181,14 @@ export class GameClient {
 		const after = this.lastEventId >= 0 ? `?after=${this.lastEventId}` : '';
 		const es = new EventSource(`/api/rooms/${this.roomId}/events${after}`);
 		this.es = es;
-		this.setTransport('connecting');
-		es.onopen = () => this.setTransport('online');
+		// Reconnecting (not first connect) resumes via ?after= so events
+		// published during the blackout are replayed from the ring buffer.
+		const wasDown = this.transport === 'disconnected' || this.transport === 'reconnecting';
+		this.setTransport(wasDown ? 'reconnecting' : 'connecting');
+		es.onopen = () => {
+			this.reconnectAt = 0;
+			this.setTransport('online');
+		};
 		es.onmessage = (e) => {
 			try {
 				const ev = JSON.parse(e.data) as SnapshotEvent;

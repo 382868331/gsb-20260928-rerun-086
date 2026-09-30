@@ -15,15 +15,16 @@ export interface ClientViewState {
 	lastCorrection: { fromX: number; fromY: number; toX: number; toY: number; at: number } | null;
 }
 
-export function initialView(initialAuth: ClientViewState['auth']): ClientViewState {
+export function initialView(initialAuth: ClientViewState['auth'], charId?: string): ClientViewState {
+	const own = initialAuth.find((c) => c.id === charId) ?? initialAuth[0];
 	return {
 		auth: initialAuth,
 		tick: 0,
 		hash: '',
 		pending: [],
-		predX: initialAuth[0]?.x ?? 0,
-		predY: initialAuth[0]?.y ?? 0,
-		predFacing: initialAuth[0]?.facing ?? 'right',
+		predX: own?.x ?? 0,
+		predY: own?.y ?? 0,
+		predFacing: own?.facing ?? 'right',
 		lastCorrection: null,
 	};
 }
@@ -72,34 +73,52 @@ export function applyAuthority(
 ): ClientViewState {
 	const me = snap.chars.find((c) => c.id === charId);
 	if (!me) return state;
-	// Any pending input at or below the authority's ack is finished (confirmed
-	// or executed-but-blocked). Only still-in-flight seqs are re-predicted.
-	const stillPending = state.pending.filter((p) => p.seq > me.appliedSeq);
-	const newlyConfirmed = state.pending.filter((p) => appliedSeqs.includes(p.seq));
-	newlyConfirmed.forEach((p) => {
+	// Any pending input at or below the authority's ack is finished. A seq
+	// can be confirmed in two ways:
+	//   - it is listed in this event's applied[] (executed or blocked), or
+	//   - the snapshot's appliedSeq jumped past it (backlog replay after a
+	//     reconnect fills events whose applied[] we never rendered).
+	const acked = new Set(appliedSeqs);
+	const confirmed = state.pending.filter((p) => p.seq <= me.appliedSeq || acked.has(p.seq));
+	const stillPending = state.pending.filter((p) => p.seq > me.appliedSeq && !acked.has(p.seq));
+	confirmed.forEach((p) => {
 		p.status = 'confirmed';
 	});
+	// Correction detection for confirmed inputs: replay the just-confirmed
+	// prefix on top of the PREVIOUS authoritative base and compare the last
+	// predicted cell with the server's actual position. Comparing the final
+	// rendered layer (as before) reported phantom corrections whenever
+	// unacked inputs remained in flight, because their re-prediction tail
+	// legitimately differs from the confirmed base.
+	let correction = state.lastCorrection;
+	if (confirmed.length > 0) {
+		const prevMe = state.auth.find((c) => c.id === charId);
+		let rx = prevMe?.x ?? me.x;
+		let ry = prevMe?.y ?? me.y;
+		for (const p of confirmed) {
+			const others = state.auth.filter((c) => c.id !== charId).map((c) => ({ x: c.x, y: c.y }));
+			const n = step(rx, ry, p.cmd, others, cfg);
+			rx = n.x;
+			ry = n.y;
+		}
+		if (rx !== me.x || ry !== me.y) {
+			correction = { fromX: rx, fromY: ry, toX: me.x, toY: me.y, at: Date.now() };
+		}
+	}
+	// Re-predict the still-in-flight tail from the new authority base.
+	// Other characters move too (simultaneous input), so their LATEST
+	// snapshot positions are used for every step; our own tail is layered.
 	let px = me.x;
 	let py = me.y;
 	let facing = me.facing;
 	for (const p of stillPending) {
-		const others = snap.chars.filter((c) => c.id !== charId).map((c) => ({ x: c.x, y: c.y }));
-		const n = step(px, py, p.cmd, others, cfg);
+		let n = step(px, py, p.cmd, snap.chars.filter((c) => c.id !== charId).map((c) => ({ x: c.x, y: c.y })), cfg);
 		px = n.x;
 		py = n.y;
 		if (p.cmd !== 'wait') facing = p.cmd;
 		p.predX = px;
 		p.predY = py;
 	}
-	// Correction is detected from the client's previous rendered layer:
-	// before folding the snapshot, pending inputs predicted state.predX/Y;
-	// after folding, the truth is either the server pos (nothing in flight) or
-	// the re-predicted tail. Any mismatch snaps instead of smoothing.
-	const corrected = state.predX !== px || state.predY !== py;
-	const correction =
-		corrected
-			? { fromX: state.predX, fromY: state.predY, toX: me.x, toY: me.y, at: Date.now() }
-			: state.lastCorrection;
 	return {
 		auth: snap.chars,
 		tick: snap.tick,

@@ -74,3 +74,12 @@ export interface PendingInput {
 	predY: number;
 	msg?: string;
 }
+
+// QueuedInput is an input held locally while the link is down. It is not
+// dropped or optimistically retried; after reconnect it is delivered once
+// with the same seq.
+export interface QueuedInput {
+	seq: number;
+	cmd: Command;
+	queuedAt: number;
+}

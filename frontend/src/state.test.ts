@@ -70,4 +70,48 @@ describe('client prediction and authority reconciliation', () => {
 		expect(s.pending.map((p) => p.seq)).toEqual([2]);
 		expect([s.predX, s.predY]).toEqual([3, 1]);
 	});
+
+	it('does not report a phantom correction while an in-flight tail remains', () => {
+		// seq1 confirmed at (2,1); seq2 is still in flight and re-predicted to
+		// (3,1). The old code compared the final tail against nothing and
+		// flashed a correction even though the server agreed with seq1.
+		let s = applyLocalInput(start(), 'c1', 1, 'right', cfg);
+		s = applyLocalInput(s, 'c1', 2, 'right', cfg);
+		const snap: Snapshot = {
+			tick: 1, hash: 'h',
+			chars: [
+				{ id: 'c1', x: 2, y: 1, facing: 'right', appliedSeq: 1 },
+				{ id: 'c2', x: 4, y: 1, facing: 'left', appliedSeq: 0 },
+			],
+		};
+		s = applyAuthority(s, 'c1', snap, [1], cfg);
+		expect(s.lastCorrection).toBeNull();
+	});
+
+	it('re-predicts unacked input against the other char\'s latest position', () => {
+		// Both clients move simultaneously. c1's seq2 predicted (3,1) from a
+		// stale view, but the new snapshot shows c2 now at (3,1): the tail
+		// must be re-predicted against the fresh snapshot and block at (2,1).
+		let s = applyLocalInput(start(), 'c1', 1, 'right', cfg);
+		s = applyLocalInput(s, 'c1', 2, 'right', cfg);
+		const snap: Snapshot = {
+			tick: 1, hash: 'h',
+			chars: [
+				{ id: 'c1', x: 2, y: 1, facing: 'right', appliedSeq: 1 },
+				{ id: 'c2', x: 3, y: 1, facing: 'left', appliedSeq: 1 },
+			],
+		};
+		s = applyAuthority(s, 'c1', snap, [1], cfg);
+		expect([s.predX, s.predY]).toEqual([2, 1]);
+		expect(s.pending.map((p) => p.seq)).toEqual([2]);
+	});
+
+	it('initialView anchors the predicted layer to the local char', () => {
+		const s = initialView([
+			{ id: 'c1', x: 2, y: 2, facing: 'right', appliedSeq: 0 },
+			{ id: 'c2', x: 15, y: 7, facing: 'left', appliedSeq: 0 },
+		], 'c2');
+		expect([s.predX, s.predY]).toEqual([15, 7]);
+		expect(s.predFacing).toBe('left');
+	});
 });

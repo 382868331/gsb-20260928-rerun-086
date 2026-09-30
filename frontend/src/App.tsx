@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { createRoom, runReplay, type ChaosConfig, defaultChaos } from './api';
 import { ClientPanel } from './ClientPanel';
+import { ErrorBoundary } from './ErrorBoundary';
 import type { ReplayResult, RoomInfo } from './types';
 
 interface LogLine {
@@ -25,14 +26,17 @@ export default function App() {
 		setLogs((prev) => [...prev.slice(-80), line]);
 	}
 
-	useEffect(() => {
+	function bootstrap() {
+		setError('');
 		createRoom()
 			.then((info) => {
 				setRoom(info);
 				pushLog(`房间已创建：${info.roomId}（两个角色、两个会话）`, 'ok');
 			})
-			.catch((e) => setError(`无法连接 Go 权威服务：${String(e)}`));
-	}, []);
+			.catch((e) => setError(`无法连接 Go 权威服务：${String(e)}。控制台与演练控件仍可操作。`));
+	}
+
+	useEffect(bootstrap, []);
 
 	useEffect(() => {
 		if (!autoReplay || !room) return;
@@ -54,17 +58,25 @@ export default function App() {
 		);
 	}
 
-	if (error) {
-		return <div className="fatal">{error}<br />请先启动 Go 服务：<code>go run ./cmd/server</code></div>;
-	}
-	if (!room) return <div className="fatal">正在创建权威房间…</div>;
-
 	return (
 		<div className="app">
 			<header className="topbar">
 				<h1>游戏服务研发平台 · 虚拟角色状态同步</h1>
-				<div className="room mono small">room {room.roomId}</div>
+				<div className="room mono small">{room ? `room ${room.roomId}` : '尚无活动房间'}</div>
 			</header>
+
+			{error && (
+				<section className="replay bad">
+					<div>{error}</div>
+					<button onClick={bootstrap}>重试创建房间</button>
+					<code className="mono small">cd server &amp;&amp; go run ./cmd/server</code>
+				</section>
+			)}
+			{!room && !error && (
+				<section className="replay">
+					<div className="muted">正在向权威服务申请演示房间…服务未启动时这里会给出可操作提示，页面不会白屏。</div>
+				</section>
+			)}
 
 			<section className="controls">
 				<div className="control-group">
@@ -86,7 +98,7 @@ export default function App() {
 					<b>{Math.round(chaos.duplicateRate * 100)}%</b>
 				</div>
 				<div className="control-group">
-					<label>断开持续 ms（手动按钮使用）</label>
+					<label>断开持续 ms（演练按钮使用）</label>
 					<input
 						type="range" min={500} max={6000} step={100}
 						value={chaos.blinkMs || 2500}
@@ -95,9 +107,9 @@ export default function App() {
 					<b>{chaos.blinkMs || 2500}</b>
 				</div>
 				<div className="control-group replay-group">
-					<button onClick={doReplay}>从保存事件重放校验</button>
+					<button onClick={doReplay} disabled={!room}>从保存事件重放校验</button>
 					<label className="inline">
-						<input type="checkbox" checked={autoReplay} onChange={(e) => setAutoReplay(e.target.checked)} />
+						<input type="checkbox" checked={autoReplay} onChange={(e) => setAutoReplay(e.target.checked)} disabled={!room} />
 						每 4 秒自动校验
 					</label>
 				</div>
@@ -110,17 +122,26 @@ export default function App() {
 					<div>重放 hash：<code>{replay.finalHash.slice(0, 20)}</code></div>
 					<div className="verdict">{replay.match ? '✓ 重放结果与服务端实时结论完全一致' : `✗ 在 tick ${replay.divergedAt} 出现分歧`}</div>
 				</section>
-		)}
+			)}
 
-			<section className="panels">
-				<ClientPanel room={room} sessionIndex={0} chaos={chaos} duplicateSeen={(t) => pushLog(t, 'warn')} />
-				<ClientPanel room={room} sessionIndex={1} chaos={chaos} duplicateSeen={(t) => pushLog(t, 'warn')} />
-			</section>
+			<ErrorBoundary>
+				{room ? (
+					<section className="panels">
+						<ClientPanel room={room} sessionIndex={0} chaos={chaos} duplicateSeen={(t) => pushLog(t, 'warn')} />
+						<ClientPanel room={room} sessionIndex={1} chaos={chaos} duplicateSeen={(t) => pushLog(t, 'warn')} />
+					</section>
+				) : (
+					<section className="panels-placeholder">
+						<div className="panel placeholder">客户端 A：等待房间…</div>
+						<div className="panel placeholder">客户端 B：等待房间…</div>
+					</section>
+				)}
+			</ErrorBoundary>
 
 			<section className="journal">
 				<h3>客户端事件 / 网络异常日志</h3>
 				<div className="loglines">
-					{logs.length === 0 && <div className="muted">操作两个客户端后，这里显示幂等确认、重连续传与拒绝接管等事件。</div>}
+					{logs.length === 0 && <div className="muted">暂无事件：操作两个客户端后，这里显示幂等确认、重连续传与拒绝接管等事件。页面不会因为空事件而崩溃。</div>}
 					{logs.map((l) => (
 						<div key={l.id} className={`logline ${l.kind}`}>
 							<span className="ts">{new Date(l.at).toLocaleTimeString()}</span>

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { GameClient, type ChaosConfig, type TransportStatus } from './api';
 import { Board } from './Board';
 import { applyAuthority, applyLocalInput, initialView, type ClientViewState } from './state';
-import type { Command, EnqueueResult, RoomInfo, SnapshotEvent } from './types';
+import type { Command, EnqueueResult, QueuedInput, RoomInfo, SnapshotEvent } from './types';
 
 interface Props {
 	room: RoomInfo;
@@ -32,14 +32,15 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 		[room],
 	);
 	const [view, setView] = useState<ClientViewState>(() =>
-		initialView(room.chars.map((c) => ({ id: c.id, x: c.x, y: c.y, facing: 'right', appliedSeq: 0 }))),
+		initialView(
+			room.chars.map((c) => ({ id: c.id, x: c.x, y: c.y, facing: 'right', appliedSeq: 0 })),
+			session.charId,
+		),
 	);
 	const [status, setStatus] = useState<TransportStatus>('connecting');
 	const seqRef = useRef(0);
-	const [busy, setBusy] = useState(false);
 	const [notice, setNotice] = useState<string>('');
-	const viewRef = useRef(view);
-	viewRef.current = view;
+	const [queued, setQueued] = useState<QueuedInput[]>([]);
 
 	useEffect(() => {
 		client.chaos = chaos;
@@ -48,24 +49,36 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 	useEffect(() => {
 		client.connectStream();
 		const offEvt = client.onEvent((ev: SnapshotEvent) => {
-			setView((prev) => {
-				const appliedForMe = ev.applied.filter((a) => a.charId === client.charId).map((a) => a.seq);
-				return applyAuthority(prev, client.charId, ev.snapshot, appliedForMe, cfg);
-			});
+			try {
+				if (!ev || ev.type !== 'snapshot' || !Array.isArray(ev.snapshot?.chars)) return;
+				const mine = ev.snapshot.chars.some((ch) => ch.id === client.charId);
+				if (!mine) {
+					duplicateSeen('收到不含本角色的异常快照，已忽略（页面保持可用）');
+					return;
+				}
+				setView((prev) => {
+					const appliedForMe = (ev.applied ?? []).filter((a) => a.charId === client.charId).map((a) => a.seq);
+					return applyAuthority(prev, client.charId, ev.snapshot, appliedForMe, cfg);
+				});
+			} catch (err) {
+				duplicateSeen(`快照处理失败已隔离：${String(err)}`);
+			}
 		});
 		const offStatus = client.onStatus(setStatus);
+		const offQueue = client.onQueue(setQueued);
 		return () => {
 			offEvt();
 			offStatus();
-		client.closeStream();
+			offQueue();
+			client.closeStream();
 		};
 	}, [client, cfg]);
 
 	async function issue(cmd: Command) {
-		if (busy) return;
+		// Inputs may be issued at any time, including during a blackout:
+		// the transport holds them and the pending layer keeps them visible.
 		const seq = ++seqRef.current;
 		setView((prev) => applyLocalInput(prev, client.charId, seq, cmd, cfg));
-		setBusy(true);
 		try {
 			const { status: code, result } = await client.sendInput(seq, cmd, (_code, dup: EnqueueResult) => {
 				duplicateSeen(`重复送达 seq=${seq}：服务端幂等响应 ${dup.status}`);
@@ -77,8 +90,6 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 			}
 		} catch (err) {
 			duplicateSeen(`seq=${seq} 发送失败：${String(err)}`);
-		} finally {
-			setBusy(false);
 		}
 	}
 
@@ -110,6 +121,7 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 
 	const me = view.auth.find((c) => c.id === client.charId);
 	const predicting = view.pending.length > 0;
+	const offline = status === 'disconnected' || status === 'reconnecting';
 	return (
 		<section className="panel">
 			<header className="panel-head">
@@ -140,17 +152,39 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 			<span className="tag predicted">◈ 本地预测（未确认）</span>
 			{view.lastCorrection && <span className="tag corrected">↩ 偏差已按服务端修正</span>}
 		</div>
+		{view.pending.length > 0 && (
+			<div className="pendingbox">
+				{view.pending.map((p) => (
+					<code key={p.seq} className="pending-item">
+						seq {p.seq} · {p.cmd} · 预测 ({p.predX},{p.predY}) · {offline ? '断线留存' : '在途'}
+					</code>
+				))}
+			</div>
+		)}
 
 		<div className="stats">
 			<span>权威 tick: <b>{view.tick}</b></span>
 			<span>已确认 seq: <b>{me?.appliedSeq ?? 0}</b></span>
 			<span>待确认: <b className={predicting ? 'warn' : ''}>{view.pending.length}</b></span>
+			{offline && <span className="warn">断线队列: <b>{queued.length}</b></span>}
 		</div>
+		{(queued.length > 0 || offline) && (
+			<div className="queuebox">
+				<span>
+					{offline
+						? `链路断开：${queued.length} 条未确认输入本地保留，重连后按原 seq 接续发送`
+						: `重连完成，${queued.length} 条积压输入正在投递…`}
+				</span>
+				{queued.map((q) => (
+					<code key={q.seq} className="queue-item">seq {q.seq} · {q.cmd}</code>
+				))}
+			</div>
+		)}
 		<div className="hash mono small">snapshot hash: {view.hash.slice(0, 20) || '…'}</div>
 
 		<div className="dpad">
 			{CMDS.map((c) => (
-				<button key={c.cmd} disabled={busy || status === 'disconnected'} onClick={() => issue(c.cmd)}>
+				<button key={c.cmd} onClick={() => issue(c.cmd)}>
 					{c.label}
 				</button>
 			))}

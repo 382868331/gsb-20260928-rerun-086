@@ -1,3 +1,4 @@
+import { Fragment } from 'react';
 import type { CharMeta, CharState, Command } from './types';
 
 interface BoardProps {
@@ -44,14 +45,11 @@ export function Board(props: BoardProps) {
 				const st = states.find((s) => s.id === meta.id);
 				if (!st) return null;
 				const predicted = isLocal && props.hasPending;
-				const x = predicted ? props.predX : st.x;
-				const y = predicted ? props.predY : st.y;
-				const facing = predicted ? props.predFacing : st.facing;
-				const corrected = isLocal && props.lastCorrectionAt && Date.now() - props.lastCorrectionAt < 900;
-				return (
+				const corrected = !!(isLocal && props.lastCorrectionAt && Date.now() - props.lastCorrectionAt < 900);
+				const marker = (x: number, y: number, facing: Command, kind: 'confirmed' | 'predicted') => (
 					<div
-						key={meta.id}
-						className={`char ${predicted ? 'predicted' : 'confirmed'} ${corrected ? 'corrected' : ''}`}
+						key={`${meta.id}-${kind}`}
+						className={`char ${kind} ${kind === 'confirmed' && predicted ? 'ghost' : ''} ${kind === 'confirmed' && corrected ? 'corrected' : ''}`}
 						style={{
 							left: `${(x / width) * 100}%`,
 							top: `${(y / height) * 100}%`,
@@ -59,11 +57,22 @@ export function Board(props: BoardProps) {
 							height: `${100 / height}%`,
 							background: meta.color,
 						}}
-						title={predicted ? '本地预测位置（未经服务端确认）' : '服务端确认位置'}
+						title={kind === 'predicted' ? '本地预测位置（未经服务端确认）' : '服务端已确认位置（最后权威快照）'}
 					>
 						<span>{arrow[facing]}</span>
-						<label>{meta.name}</label>
+						<label>{meta.name}{kind === 'predicted' ? ' · 预测' : ''}</label>
 					</div>
+				);
+				if (!predicted) return marker(st.x, st.y, st.facing, 'confirmed');
+				// While inputs are unacked, draw BOTH layers: the solid ghost
+				// stays at the last confirmed cell, the dashed marker shows
+				// the predicted cell. They coincide when the prediction so
+				// far agrees with the last authority (e.g. waiting).
+				return (
+					<Fragment key={meta.id}>
+						{marker(st.x, st.y, st.facing, 'confirmed')}
+						{marker(props.predX, props.predY, props.predFacing, 'predicted')}
+					</Fragment>
 				);
 			})}
 		</div>

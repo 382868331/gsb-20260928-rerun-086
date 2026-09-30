@@ -96,6 +96,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .char.confirmed {
 	box-shadow: 0 0 0 2px rgba(255, 255, 255, .85), 0 4px 10px rgba(0, 0, 0, .45);
 }
+.char.confirmed.ghost { opacity: .45; }
 .char.predicted {
 	background: transparent !important;
 	border: 2px dashed var(--pred);
@@ -124,6 +125,29 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 }
 .chaos-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .notice { margin-top: 8px; color: var(--warn); font-size: 12px; }
+
+.queuebox, .pendingbox {
+	display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+	margin: 6px 0 8px; font-size: 11.5px; color: var(--warn);
+}
+.queue-item, .pending-item {
+	background: var(--panel2); border: 1px solid var(--line);
+	border-radius: 6px; padding: 2px 8px; color: var(--text);
+}
+.pending-item { border-color: rgba(245, 215, 110, .45); color: var(--pred); }
+
+.panels-placeholder { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.panel.placeholder {
+	min-height: 320px; display: flex; align-items: center; justify-content: center;
+	color: var(--muted); border-style: dashed;
+}
+@media (max-width: 980px) { .panels-placeholder { grid-template-columns: 1fr; } }
+
+.boundary { background: rgba(248, 113, 113, .08); border: 1px solid rgba(248,113,113,.5); border-radius: 12px; }
+.boundary pre {
+	white-space: pre-wrap; max-height: 240px; overflow: auto;
+	background: var(--panel2); padding: 10px; border-radius: 8px;
+}
 
 .journal {
 	margin-top: 16px; background: var(--panel); border: 1px solid var(--line);
