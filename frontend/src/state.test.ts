@@ -15,6 +15,15 @@ function start() {
 }
 
 describe('client prediction and authority reconciliation', () => {
+	it('survives an idle heartbeat snapshot with no applied inputs', () => {
+		const s0 = start();
+		const snap = { tick: 7, hash: 'hb', chars: undefined } as unknown as Snapshot;
+		const s1 = applyAuthority(s0, 'c1', snap, [], cfg);
+		expect(s1).toBe(s0);
+		const snap2 = { tick: 8, hash: 'hb2', chars: null } as unknown as Snapshot;
+		expect(applyAuthority(s0, 'c1', snap2, [], cfg)).toBe(s0);
+	});
+
 	it('predicts locally before the server acks', () => {
 		const s = applyLocalInput(start(), 'c1', 1, 'right', cfg);
 		expect(s.pending).toHaveLength(1);

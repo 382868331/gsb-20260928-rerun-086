@@ -70,7 +70,8 @@ export function applyAuthority(
 	appliedSeqs: number[],
 	cfg: PredConfig,
 ): ClientViewState {
-	const me = snap.chars.find((c) => c.id === charId);
+	const chars = snap.chars ?? [];
+	const me = chars.find((c) => c.id === charId);
 	if (!me) return state;
 	// Any pending input at or below the authority's ack is finished (confirmed
 	// or executed-but-blocked). Only still-in-flight seqs are re-predicted.
@@ -83,7 +84,7 @@ export function applyAuthority(
 	let py = me.y;
 	let facing = me.facing;
 	for (const p of stillPending) {
-		const others = snap.chars.filter((c) => c.id !== charId).map((c) => ({ x: c.x, y: c.y }));
+		const others = chars.filter((c) => c.id !== charId).map((c) => ({ x: c.x, y: c.y }));
 		const n = step(px, py, p.cmd, others, cfg);
 		px = n.x;
 		py = n.y;
@@ -101,7 +102,7 @@ export function applyAuthority(
 			? { fromX: state.predX, fromY: state.predY, toX: me.x, toY: me.y, at: Date.now() }
 			: state.lastCorrection;
 	return {
-		auth: snap.chars,
+		auth: chars,
 		tick: snap.tick,
 		hash: snap.hash,
 		pending: stillPending,

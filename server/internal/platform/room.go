@@ -109,6 +109,9 @@ func (ri *RoomInstance) runTick() {
 	batch := ri.pending
 	ri.pending = nil
 	applied, snap := ri.eng.ApplyTick(batch)
+	if applied == nil {
+		applied = []game.AppliedInput{}
+	}
 	snap.Hash = snap.HashValue()
 	rejected := make([]rejectedInput, 0)
 	appliedSet := map[string]struct{}{}
@@ -149,7 +152,7 @@ func (ri *RoomInstance) publishLocked(m pubMsg) {
 		rings := ri.ring[len(ri.ring)-ringCapacity:]
 		rings0 := make([]pubMsg, len(rings))
 		copy(rings0, rings)
-		rings = rings0
+		ri.ring = rings0
 	}
 	// Slow subscribers are disconnected instead of blocking the tick loop.
 	for _, ch := range ri.subs {

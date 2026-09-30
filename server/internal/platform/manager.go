@@ -96,7 +96,9 @@ func (m *Manager) tickLoop(ri *RoomInstance) {
 		// reconnecting and connected clients see a live authority clock.
 		snap := ri.eng.Snapshot()
 		snap.Hash = snap.HashValue()
-		ev := snapshotEvent{Type: "snapshot", Snapshot: snap}
+		// Applied must serialize as [] not null: idle heartbeats reach the
+		// client too, and a null field crashes the snapshot folding there.
+		ev := snapshotEvent{Type: "snapshot", Snapshot: snap, Applied: []game.AppliedInput{}}
 		payload, _ := json.Marshal(ev)
 		ri.publishLocked(pubMsg{id: ri.nextEvtID, payload: payload})
 		ringsNext := ri.nextEvtID

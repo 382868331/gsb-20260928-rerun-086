@@ -49,7 +49,10 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 		client.connectStream();
 		const offEvt = client.onEvent((ev: SnapshotEvent) => {
 			setView((prev) => {
-				const appliedForMe = ev.applied.filter((a) => a.charId === client.charId).map((a) => a.seq);
+				// Idle heartbeats carry no applied inputs; tolerate a missing
+				// list instead of crashing the whole page on empty state.
+				const applied = ev.applied ?? [];
+				const appliedForMe = applied.filter((a) => a.charId === client.charId).map((a) => a.seq);
 				return applyAuthority(prev, client.charId, ev.snapshot, appliedForMe, cfg);
 			});
 		});
