@@ -133,8 +133,8 @@ func (s *Server) postInput(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, code, res)
 }
 
-// events is the SSE stream. Last-Event-ID (header or ?after=) resumes from
-// the in-memory ring buffer without re-running any input.
+// events is the SSE stream. Last-Event-ID/?after resume from the in-memory
+// ring; afterTick survives a process restart and never re-runs an input.
 func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	ri, err := s.roomOrLoad(r.PathValue("id"))
 	if err != nil {
@@ -142,6 +142,7 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	after := int64(-1)
+	afterTick := int64(-1)
 	if v := r.Header.Get("Last-Event-ID"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			after = n
@@ -152,6 +153,12 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 			after = n
 		}
 	}
+	if v := r.URL.Query().Get("afterTick"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			afterTick = n
+			after = -1
+		}
+	}
 	fl, ok := w.(http.Flusher)
 	if !ok {
 		writeErr(w, 500, "streaming unsupported")
@@ -159,7 +166,7 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Connection", "keep-alive")
-	subID, ch, backlog := ri.subscribe(after)
+	subID, ch, backlog := ri.subscribe(after, afterTick)
 	defer ri.unsubscribe(subID)
 	// Backlog first, then live events.
 	ping := []byte(": ping\n\n")

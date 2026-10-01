@@ -77,6 +77,8 @@ type AppliedInput struct {
 	Seq       int64   `json:"seq"`
 	Cmd       Command `json:"cmd"`
 	Accepted  bool    `json:"accepted"`
+	X         int     `json:"x"`
+	Y         int     `json:"y"`
 }
 
 // TickRecord is one deterministic append-only event in the room journal.
@@ -169,6 +171,7 @@ func (r *Room) ApplyTick(inputs []Input) ([]AppliedInput, Snapshot) {
 			c.X, c.Y = nx, ny
 			rec.Accepted = true
 		}
+		rec.X, rec.Y = c.X, c.Y
 		applied = append(applied, rec)
 	}
 	return applied, r.Snapshot()

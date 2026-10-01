@@ -41,6 +41,8 @@ export interface AppliedInput {
 	seq: number;
 	cmd: Command;
 	accepted: boolean;
+	x: number;
+	y: number;
 }
 
 export interface SnapshotEvent {
@@ -73,4 +75,10 @@ export interface PendingInput {
 	predX: number;
 	predY: number;
 	msg?: string;
+}
+
+export interface RejectedInput extends PendingInput {
+	finalX: number;
+	finalY: number;
+	reason: string;
 }

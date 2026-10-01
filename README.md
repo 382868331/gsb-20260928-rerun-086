@@ -11,8 +11,9 @@
   收到服务端快照后以快照为准（实心）；预测与确认在画面上有明确区别。
 - 服务确认：每个会话的输入带单调递增 `seq`；服务端推进 `appliedSeq` 并在
   SSE 快照里带回。被墙体/碰撞挡住的移动也会消费该 seq（确认但不移动）。
-- 偏差修正：客户端把待确认队列在新快照上重新推算，预测位置与权威位置不一致时
-  **直接吸附到服务端坐标并闪烁提示**，不做插值平滑、不覆盖服务端结论。
+- 偏差修正：客户端把待确认队列在新快照上重新推算；权威拒绝/阻挡某个输入时保留
+  该输入的预测点、最终点和原因，后续未拒绝输入仍按原 seq 顺序重放。预测位置与
+  权威位置不一致时**直接吸附到服务端坐标并闪烁提示**，不做插值平滑。
 - 幂等与旧输入：`seq <= 已确认` 或同一 tick 内重复入队都返回 `stale` 幂等响应，
   旧输入不会执行第二遍。
 - 会话安全：输入必须携带创建房间时下发的 session id，服务端校验
@@ -20,12 +21,14 @@
 - 网络异常模拟（纯客户端制造，可观察）：
   - 消息迟到：输入延迟 0–1500ms 发出；
   - 重复送达：按概率把同一输入再投递一次，可看到服务端的 stale ack；
-  - 短暂断开：断开 SSE 并挂起 POST，恢复后用 `Last-Event-ID`/`?after=` 续传，
-    断连期间未发出的输入随后照常发送，服务端不重放任何旧输入。
-- 事件保存与重放：每个有输入的 tick 追加到 `server/data/<room>.jsonl`
-  （`init` + `tick` 记录，含规范快照 hash）。重放接口纯靠日志重建全部快照并与
-  实时记录逐 tick 比对 hash；重启后 `LoadRoom` 用重放恢复到最终 tick 再继续，
-  tick 编号不会回绕。
+  - 短暂断开：断开 SSE 并串行挂起 POST，离线期间可继续形成本地输入；恢复后按本地
+    seq 顺序发送，乱序到达时服务端先缓冲缺口，连续后再进入权威 tick。
+  - 保存恢复：待确认输入、最后确认水位、预测层和拒绝回看写入浏览器 localStorage；
+    页面中途刷新后会重发待确认输入并从最后权威 tick 续传。
+- 事件保存与重放：有输入的 tick 追加为 `tick`，已入站但尚未执行的缺口输入追加为
+  `queued`，文件位于 `server/data/<room>.jsonl`。重放接口纯靠日志重建全部快照并与
+  实时记录逐 tick 比对 hash；重启后 `LoadRoom` 先重放已确认 tick，再恢复仍未执行的
+  `queued` 输入，tick 编号不会回绕。
 
 ## 目录
 
@@ -50,7 +53,7 @@ cd frontend && npm run dev
 ## HTTP
 
 - `POST /api/rooms` → `{ roomId, config, chars, sessions }`（sessions 即两个角色的会话凭据）
-- `GET  /api/rooms/{id}/events`：SSE，支持 `Last-Event-ID` / `?after=N` 断线续传
+- `GET  /api/rooms/{id}/events`：SSE，支持 `Last-Event-ID` / `?after=N`，以及跨重启的 `?afterTick=N`
 - `POST /api/rooms/{id}/inputs`：`{ sessionId, charId, seq, cmd }`，
   返回 `202 accepted` / `200 stale` / `403 forbidden`
 - `POST /api/rooms/{id}/replay`：从落盘事件重放并返回 hash 比对结果

@@ -162,3 +162,50 @@ func TestSSEBacklog(t *testing.T) {
 		t.Fatal("handler did not stop after context cancel")
 	}
 }
+
+func TestOutOfOrderInputsExecuteInSessionSequence(t *testing.T) {
+	c, srv := newTestServer(t)
+	info := createRoom(t, c)
+	s := info.Sessions[0]
+	body := func(seq int64, cmd string) map[string]interface{} {
+		return map[string]interface{}{"sessionId": s.ID, "charId": s.CharID, "seq": seq, "cmd": cmd}
+	}
+
+	// seq 3/2 arrive first and must wait for the missing predecessor.
+	if code, _ := postInput(t, c, info.ID, body(3, "right")); code != 202 {
+		t.Fatalf("seq 3 code = %d", code)
+	}
+	if code, _ := postInput(t, c, info.ID, body(2, "up")); code != 202 {
+		t.Fatalf("seq 2 code = %d", code)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	if code, _ := postInput(t, c, info.ID, body(1, "right")); code != 202 {
+		t.Fatalf("seq 1 code = %d", code)
+	}
+	if code, _ := postInput(t, c, info.ID, body(1, "right")); code != 200 {
+		t.Fatalf("duplicate seq 1 before tick code = %d, want stale 200", code)
+	}
+	if code, _ := postInput(t, c, info.ID, body(3, "right")); code != 200 {
+		t.Fatalf("duplicate seq 3 code = %d, want stale 200", code)
+	}
+	time.Sleep(350 * time.Millisecond)
+	ri, err := srv.mgr.Get(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	me := ri.eng.Chars[0]
+	if me.AppliedSeq != 3 {
+		t.Fatalf("applied seq = %d, want 3", me.AppliedSeq)
+	}
+	if me.X != 4 || me.Y != 1 {
+		t.Fatalf("position = (%d,%d), want (4,1): seq order must be right, up, right", me.X, me.Y)
+	}
+	rep, err := ReplayFromDisk(srv.mgr.dir, info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Match || rep.Ticks != 1 {
+		t.Fatalf("reordered batch replay = %+v", rep)
+	}
+}

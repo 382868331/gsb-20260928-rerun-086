@@ -1,4 +1,4 @@
-import type { CharState, Command, PendingInput, Snapshot } from './types';
+import type { AppliedInput, CharState, Command, PendingInput, RejectedInput, Snapshot } from './types';
 import { step, type PredConfig } from './predict';
 
 export interface ClientViewState {
@@ -12,6 +12,7 @@ export interface ClientViewState {
 	predX: number;
 	predY: number;
 	predFacing: Command;
+	rejectedInputs: RejectedInput[];
 	lastCorrection: { fromX: number; fromY: number; toX: number; toY: number; at: number } | null;
 }
 
@@ -24,6 +25,7 @@ export function initialView(initialAuth: ClientViewState['auth']): ClientViewSta
 		predX: initialAuth[0]?.x ?? 0,
 		predY: initialAuth[0]?.y ?? 0,
 		predFacing: initialAuth[0]?.facing ?? 'right',
+		rejectedInputs: [],
 		lastCorrection: null,
 	};
 }
@@ -67,19 +69,52 @@ export function applyAuthority(
 	state: ClientViewState,
 	charId: string,
 	snap: Snapshot,
-	appliedSeqs: number[],
+	applied: AppliedInput[],
 	cfg: PredConfig,
 ): ClientViewState {
 	const chars = snap.chars ?? [];
 	const me = chars.find((c) => c.id === charId);
-	if (!me) return state;
+	if (!me || snap.tick < state.tick) return state;
 	// Any pending input at or below the authority's ack is finished (confirmed
 	// or executed-but-blocked). Only still-in-flight seqs are re-predicted.
 	const stillPending = state.pending.filter((p) => p.seq > me.appliedSeq);
-	const newlyConfirmed = state.pending.filter((p) => appliedSeqs.includes(p.seq));
-	newlyConfirmed.forEach((p) => {
-		p.status = 'confirmed';
-	});
+	const mine = applied.filter((a) => a.charId === charId);
+	const settled = new Map(mine.map((a) => [a.seq, a]));
+	const rejectedInputs = [...state.rejectedInputs];
+	let correction = state.lastCorrection;
+	const pendingBySeq = new Map(state.pending.map((p) => [p.seq, p]));
+	const previousMe = state.auth.find((c) => c.id === charId);
+	let authorityTailX = previousMe?.x ?? me.x;
+	let authorityTailY = previousMe?.y ?? me.y;
+	for (const rec of mine) {
+		const p = pendingBySeq.get(rec.seq);
+		if (!p) continue;
+		const others = chars.filter((c) => c.id !== charId).map((c) => ({ x: c.x, y: c.y }));
+		const projected = step(authorityTailX, authorityTailY, p.cmd, others, cfg);
+		if (!rec.accepted) {
+			if (p.predX !== authorityTailX || p.predY !== authorityTailY) {
+				correction = { fromX: p.predX, fromY: p.predY, toX: authorityTailX, toY: authorityTailY, at: Date.now() };
+			}
+			rejectedInputs.push({
+				...p,
+				status: 'rejected',
+				finalX: authorityTailX,
+				finalY: authorityTailY,
+				reason: 'blocked',
+				msg: `预测 (${p.predX},${p.predY})，权威最终 (${authorityTailX},${authorityTailY})`,
+			});
+		} else {
+			authorityTailX = projected.x;
+			authorityTailY = projected.y;
+		}
+	}
+	for (const p of state.pending) {
+		if (p.seq > me.appliedSeq) continue;
+		const rec = settled.get(p.seq);
+		if (!rec && (p.predX !== authorityTailX || p.predY !== authorityTailY)) {
+			correction = { fromX: p.predX, fromY: p.predY, toX: authorityTailX, toY: authorityTailY, at: Date.now() };
+		}
+	}
 	let px = me.x;
 	let py = me.y;
 	let facing = me.facing;
@@ -96,11 +131,6 @@ export function applyAuthority(
 	// before folding the snapshot, pending inputs predicted state.predX/Y;
 	// after folding, the truth is either the server pos (nothing in flight) or
 	// the re-predicted tail. Any mismatch snaps instead of smoothing.
-	const corrected = state.predX !== px || state.predY !== py;
-	const correction =
-		corrected
-			? { fromX: state.predX, fromY: state.predY, toX: me.x, toY: me.y, at: Date.now() }
-			: state.lastCorrection;
 	return {
 		auth: chars,
 		tick: snap.tick,
@@ -109,6 +139,42 @@ export function applyAuthority(
 		predX: px,
 		predY: py,
 		predFacing: facing,
+		rejectedInputs,
 		lastCorrection: correction,
 	};
+}
+
+export function persistenceKey(roomId: string, charId: string): string {
+	return `gameplatform:client:${roomId}:${charId}`;
+}
+
+export function saveView(roomId: string, charId: string, state: ClientViewState, nextSeq: number): void {
+	const stored = {
+		nextSeq,
+		view: {
+			auth: state.auth,
+			tick: state.tick,
+			hash: state.hash,
+			pending: state.pending,
+			predX: state.predX,
+			predY: state.predY,
+			predFacing: state.predFacing,
+			rejectedInputs: state.rejectedInputs.slice(-50),
+		},
+	};
+	localStorage.setItem(persistenceKey(roomId, charId), JSON.stringify(stored));
+}
+
+export function loadView(roomId: string, charId: string): { view: ClientViewState; nextSeq: number } | null {
+	const raw = localStorage.getItem(persistenceKey(roomId, charId));
+	if (!raw) return null;
+	try {
+		const parsed = JSON.parse(raw) as { nextSeq: number; view: ClientViewState };
+		if (!Array.isArray(parsed.view?.auth) || !Array.isArray(parsed.view?.pending)) return null;
+		parsed.view.rejectedInputs ??= [];
+		parsed.view.lastCorrection = null;
+		return parsed;
+	} catch {
+		return null;
+	}
 }

@@ -61,7 +61,8 @@ func (m *Manager) CreateRoom() (*RoomInstance, CreatedRoom, error) {
 		ID: roomID, Cfg: cfg, Chars: chars, Views: views, Sessions: sessions,
 		eng:        game.NewRoom(roomID, cfg, chars),
 		journal:    journal,
-		accepted:   map[string]int64{},
+		admitted:   map[string]int64{},
+		waiting:    map[string]map[int64]game.Input{},
 		subs:       map[int]chan pubMsg{},
 		lastActive: time.Now(),
 	}
@@ -100,7 +101,7 @@ func (m *Manager) tickLoop(ri *RoomInstance) {
 		// client too, and a null field crashes the snapshot folding there.
 		ev := snapshotEvent{Type: "snapshot", Snapshot: snap, Applied: []game.AppliedInput{}}
 		payload, _ := json.Marshal(ev)
-		ri.publishLocked(pubMsg{id: ri.nextEvtID, payload: payload})
+		ri.publishLocked(pubMsg{id: ri.nextEvtID, tick: snap.Tick, payload: payload})
 		ringsNext := ri.nextEvtID
 		ri.nextEvtID = ringsNext + 1
 		if idle && nSubs == 0 {
@@ -134,6 +135,7 @@ func (m *Manager) LoadRoom(id string) error {
 	var (
 		initEntry store.InitEntry
 		records   []game.TickRecord
+		queued    []game.Input
 	)
 	err := store.ReadEntries(m.dir, id, func(line []byte) error {
 		var head struct {
@@ -155,6 +157,12 @@ func (m *Manager) LoadRoom(id string) error {
 				return err
 			}
 			records = append(records, e.TickRecord)
+		case "queued":
+			var e queuedJournalEntry
+			if err := json.Unmarshal(line, &e); err != nil {
+				return err
+			}
+			queued = append(queued, e.Input)
 		}
 		return nil
 	})
@@ -169,11 +177,34 @@ func (m *Manager) LoadRoom(id string) error {
 	if err := json.Unmarshal(initEntry.Chars, &chars); err != nil {
 		return err
 	}
-	restored, snaps, err := game.ReplayRoom(id, cfg, chars, records)
+	restored, _, err := game.ReplayRoom(id, cfg, chars, records)
 	if err != nil {
 		return err
 	}
-	_ = snaps
+	appliedSeen := map[string]map[int64]struct{}{}
+	for _, rec := range records {
+		for _, in := range rec.Inputs {
+			if appliedSeen[in.CharID] == nil {
+				appliedSeen[in.CharID] = map[int64]struct{}{}
+			}
+			appliedSeen[in.CharID][in.Seq] = struct{}{}
+		}
+	}
+	liveQueued := make([]game.Input, 0, len(queued))
+	queuedSeen := map[string]map[int64]struct{}{}
+	for _, in := range queued {
+		if _, ok := appliedSeen[in.CharID][in.Seq]; ok {
+			continue
+		}
+		if queuedSeen[in.CharID] == nil {
+			queuedSeen[in.CharID] = map[int64]struct{}{}
+		}
+		if _, ok := queuedSeen[in.CharID][in.Seq]; ok {
+			continue
+		}
+		queuedSeen[in.CharID][in.Seq] = struct{}{}
+		liveQueued = append(liveQueued, in)
+	}
 	journal, err := store.OpenStore(m.dir, id, store.InitEntry{}) // file exists: no rewrite
 	if err != nil {
 		return err
@@ -188,7 +219,11 @@ func (m *Manager) LoadRoom(id string) error {
 	ri := &RoomInstance{
 		ID: id, Cfg: cfg, Chars: restoredChars, Views: views, Sessions: sessions,
 		eng: restored, journal: journal,
-		accepted: map[string]int64{}, subs: map[int]chan pubMsg{}, lastActive: time.Now(),
+		admitted: map[string]int64{}, waiting: map[string]map[int64]game.Input{},
+		subs: map[int]chan pubMsg{}, nextEvtID: int64(len(records)), lastActive: time.Now(),
+	}
+	for _, in := range liveQueued {
+		ri.enqueueLocked(in, false)
 	}
 	m.mu.Lock()
 	m.rooms[id] = ri

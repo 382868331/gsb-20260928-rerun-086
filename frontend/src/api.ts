@@ -36,10 +36,12 @@ export class GameClient {
 	chaos: ChaosConfig = { ...defaultChaos };
 
 	private blinkUntil = 0;
+	private sendChain: Promise<void> = Promise.resolve();
 	private listeners = new Set<(ev: SnapshotEvent) => void>();
 	private statusListeners = new Set<(status: TransportStatus) => void>();
 	es: EventSource | null = null;
 	lastEventId = -1;
+	lastTick = 0;
 	transport: TransportStatus = 'connecting';
 
 	constructor(roomId: string, sessionId: string, charId: string) {
@@ -56,22 +58,34 @@ export class GameClient {
 		cmd: string,
 		onDuplicate?: (status: number, result: EnqueueResult) => void,
 	): Promise<{ status: number; result: EnqueueResult | null; heldMs: number }> {
-		const body = { sessionId: this.sessionId, charId: this.charId, seq, cmd };
-		const heldMs = await this.weatherBlackout();
-		if (this.chaos.delayMs > 0) {
-			await sleep(this.chaos.delayMs);
-		}
-		const primary = postJSON(`/api/rooms/${this.roomId}/inputs`, body);
-		let duplicate: Promise<void> | null = null;
-		if (this.chaos.duplicateRate > 0 && Math.random() < this.chaos.duplicateRate) {
-		duplicate = sleep(Math.max(120, this.chaos.delayMs + 200)).then(async () => {
-			const d = await postJSON(`/api/rooms/${this.roomId}/inputs`, body);
-			onDuplicate?.(d.status, d.json as EnqueueResult);
+		let resolveCall!: (v: { status: number; result: EnqueueResult | null; heldMs: number }) => void;
+		let rejectCall!: (err: unknown) => void;
+		const call = new Promise<{ status: number; result: EnqueueResult | null; heldMs: number }>((resolve, reject) => {
+			resolveCall = resolve;
+			rejectCall = reject;
 		});
-		}
-		const { status, json } = await primary;
-		await duplicate;
-		return { status, result: json as EnqueueResult, heldMs };
+		const run = this.sendChain.then(async () => {
+			const body = { sessionId: this.sessionId, charId: this.charId, seq, cmd };
+			try {
+				const heldMs = await this.weatherBlackout();
+				if (this.chaos.delayMs > 0) await sleep(this.chaos.delayMs);
+				const primary = postJSON(`/api/rooms/${this.roomId}/inputs`, body);
+				let duplicate: Promise<void> | null = null;
+				if (this.chaos.duplicateRate > 0 && Math.random() < this.chaos.duplicateRate) {
+					duplicate = sleep(Math.max(120, this.chaos.delayMs + 200)).then(async () => {
+						const d = await postJSON(`/api/rooms/${this.roomId}/inputs`, body);
+						onDuplicate?.(d.status, d.json as EnqueueResult);
+					});
+				}
+				const { status, json } = await primary;
+				await duplicate;
+				resolveCall({ status, result: json as EnqueueResult, heldMs });
+			} catch (err) {
+				rejectCall(err);
+			}
+		});
+		this.sendChain = run.catch(() => undefined);
+		return call;
 	}
 
 	private async weatherBlackout(): Promise<number> {
@@ -82,8 +96,8 @@ export class GameClient {
 		return waitFor;
 	}
 
-	// startBlink tears down SSE for blinkMs and holds outgoing POSTs, then the
-	// stream resumes from the last event id (no inputs are re-run by server).
+	// startBlink tears down SSE for blinkMs and serializes outgoing POSTs,
+	// then the stream resumes from the durable authority tick.
 	startBlink(ms: number) {
 		this.blinkUntil = Date.now() + ms;
 		this.setTransport('disconnected');
@@ -110,7 +124,7 @@ export class GameClient {
 
 	connectStream() {
 		if (this.es) return;
-		const after = this.lastEventId >= 0 ? `?after=${this.lastEventId}` : '';
+		const after = this.lastTick > 0 ? `?afterTick=${this.lastTick}` : '';
 		const es = new EventSource(`/api/rooms/${this.roomId}/events${after}`);
 		this.es = es;
 		this.setTransport('connecting');
@@ -121,6 +135,7 @@ export class GameClient {
 				if (ev.type === 'snapshot') {
 					const id = Number(e.lastEventId);
 					if (!Number.isNaN(id)) this.lastEventId = id;
+					this.lastTick = Math.max(this.lastTick, ev.snapshot.tick);
 					this.listeners.forEach((fn) => fn(ev));
 				}
 			} catch {

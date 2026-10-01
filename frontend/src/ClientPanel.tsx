@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { GameClient, type ChaosConfig, type TransportStatus } from './api';
 import { Board } from './Board';
-import { applyAuthority, applyLocalInput, initialView, type ClientViewState } from './state';
+import { applyAuthority, applyLocalInput, initialView, loadView, saveView, type ClientViewState } from './state';
 import type { Command, EnqueueResult, RoomInfo, SnapshotEvent } from './types';
 
 interface Props {
@@ -31,15 +31,17 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 		() => ({ width: room.config.width, height: room.config.height, obstacles: room.config.obstacles }),
 		[room],
 	);
-	const [view, setView] = useState<ClientViewState>(() =>
-		initialView(room.chars.map((c) => ({ id: c.id, x: c.x, y: c.y, facing: 'right', appliedSeq: 0 }))),
-	);
+	const [view, setView] = useState<ClientViewState>(() => {
+		const restored = loadView(room.roomId, session.charId);
+		if (restored && restored.view.auth.some((c) => c.id === session.charId)) return restored.view;
+		return initialView(room.chars.map((c) => ({ id: c.id, x: c.x, y: c.y, facing: 'right', appliedSeq: 0 })));
+	});
 	const [status, setStatus] = useState<TransportStatus>('connecting');
-	const seqRef = useRef(0);
-	const [busy, setBusy] = useState(false);
+	const seqRef = useRef(loadView(room.roomId, session.charId)?.nextSeq ?? 0);
 	const [notice, setNotice] = useState<string>('');
-	const viewRef = useRef(view);
-	viewRef.current = view;
+	useEffect(() => {
+		saveView(room.roomId, client.charId, view, seqRef.current);
+	}, [room.roomId, client.charId, view]);
 
 	useEffect(() => {
 		client.chaos = chaos;
@@ -47,13 +49,19 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 
 	useEffect(() => {
 		client.connectStream();
+		const restored = loadView(room.roomId, client.charId);
+		if (restored) {
+			client.lastTick = restored.view.tick;
+			restored.view.pending.forEach((p) => {
+				void client.sendInput(p.seq, p.cmd).then(({ status: code, result }) => {
+					if (code === 403) duplicateSeen(`seq=${p.seq} 恢复重发被会话校验拒绝`);
+					else if (result?.status === 'stale') duplicateSeen(`seq=${p.seq} 恢复重发命中 stale，未重复执行`);
+				});
+			});
+		}
 		const offEvt = client.onEvent((ev: SnapshotEvent) => {
 			setView((prev) => {
-				// Idle heartbeats carry no applied inputs; tolerate a missing
-				// list instead of crashing the whole page on empty state.
-				const applied = ev.applied ?? [];
-				const appliedForMe = applied.filter((a) => a.charId === client.charId).map((a) => a.seq);
-				return applyAuthority(prev, client.charId, ev.snapshot, appliedForMe, cfg);
+				return applyAuthority(prev, client.charId, ev.snapshot, ev.applied ?? [], cfg);
 			});
 		});
 		const offStatus = client.onStatus(setStatus);
@@ -65,10 +73,12 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 	}, [client, cfg]);
 
 	async function issue(cmd: Command) {
-		if (busy) return;
 		const seq = ++seqRef.current;
-		setView((prev) => applyLocalInput(prev, client.charId, seq, cmd, cfg));
-		setBusy(true);
+		setView((prev) => {
+			const next = applyLocalInput(prev, client.charId, seq, cmd, cfg);
+			saveView(room.roomId, client.charId, next, seqRef.current);
+			return next;
+		});
 		try {
 			const { status: code, result } = await client.sendInput(seq, cmd, (_code, dup: EnqueueResult) => {
 				duplicateSeen(`重复送达 seq=${seq}：服务端幂等响应 ${dup.status}`);
@@ -79,9 +89,7 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 				duplicateSeen(`seq=${seq} 旧输入已处理，返回 stale ack（未执行第二遍）`);
 			}
 		} catch (err) {
-			duplicateSeen(`seq=${seq} 发送失败：${String(err)}`);
-		} finally {
-			setBusy(false);
+			duplicateSeen(`seq=${seq} 发送失败，已保留本地待确认队列：${String(err)}`);
 		}
 	}
 
@@ -152,8 +160,8 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 		<div className="hash mono small">snapshot hash: {view.hash.slice(0, 20) || '…'}</div>
 
 		<div className="dpad">
-			{CMDS.map((c) => (
-				<button key={c.cmd} disabled={busy || status === 'disconnected'} onClick={() => issue(c.cmd)}>
+				{CMDS.map((c) => (
+					<button key={c.cmd} onClick={() => issue(c.cmd)}>
 					{c.label}
 				</button>
 			))}
@@ -164,15 +172,20 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 			<button onClick={tryHijack}>尝试接管对方</button>
 		</div>
 		{notice && <div className="notice">{notice}</div>}
-		</section>
-	);
+		{view.rejectedInputs.length > 0 && (
+			<div className="notice">
+				最近权威拒绝/阻挡：{view.rejectedInputs.slice(-3).map((p) => `seq ${p.seq} ${p.msg ?? ''}`).join('；')}
+			</div>
+		)}
+	</section>
+);
 }
 
 function statusLabel(s: TransportStatus): string {
 	switch (s) {
 		case 'online': return '已连接';
 		case 'connecting': return '连接中';
-		case 'reconnecting': return '重连中（Last-Event-ID 续传）';
+		case 'reconnecting': return '重连中（按权威 tick 续传）';
 		case 'disconnected': return '短暂断开';
 	}
 }

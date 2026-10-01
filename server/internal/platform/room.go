@@ -6,7 +6,6 @@ package platform
 import (
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"sync"
 	"time"
 
@@ -34,6 +33,11 @@ type rejectedInput struct {
 	Reason string     `json:"reason"`
 }
 
+type queuedJournalEntry struct {
+	Type  string     `json:"type"` // always "queued"
+	Input game.Input `json:"input"`
+}
+
 type snapshotEvent struct {
 	Type     string              `json:"type"` // "snapshot"
 	Snapshot game.Snapshot       `json:"snapshot"`
@@ -48,6 +52,7 @@ type tickJournalEntry struct {
 
 type pubMsg struct {
 	id      int64
+	tick    int64
 	payload []byte
 }
 
@@ -64,7 +69,9 @@ type RoomInstance struct {
 	eng        *game.Room
 	journal    *store.Journal
 	pending    []game.Input
-	accepted   map[string]int64 // charId -> highest seq admitted (covers in-flight inputs)
+	admitted   map[string]int64 // charId -> highest seq seen by intake
+	seen       map[string]map[int64]struct{}
+	waiting    map[string]map[int64]game.Input
 	subs       map[int]chan pubMsg
 	nextSub    int
 	ring       []pubMsg // recent SSE payloads, absolute event ids
@@ -82,24 +89,107 @@ type EnqueueResult struct {
 func (ri *RoomInstance) enqueue(in game.Input) EnqueueResult {
 	ri.mu.Lock()
 	defer ri.mu.Unlock()
+	return ri.enqueueLocked(in, true)
+}
+
+func (ri *RoomInstance) enqueueLocked(in game.Input, persist bool) EnqueueResult {
+	var owner *game.Char
 	for _, ch := range ri.Chars {
 		if ch.ID == in.CharID {
-			if ch.OwnerSession != in.SessionID {
-				return EnqueueResult{Status: "forbidden", AppliedSeq: ch.AppliedSeq}
-			}
-			maxSeq := ch.AppliedSeq
-			if admitted, ok := ri.accepted[in.CharID]; ok && admitted > maxSeq {
-				maxSeq = admitted
-			}
-			if in.Seq <= maxSeq {
-				return EnqueueResult{Status: "stale", AppliedSeq: ch.AppliedSeq}
-			}
-			ri.accepted[in.CharID] = in.Seq
+			owner = ch
+			break
 		}
 	}
-	ri.pending = append(ri.pending, in)
+	if owner == nil || owner.OwnerSession != in.SessionID {
+		applied := int64(0)
+		if owner != nil {
+			applied = owner.AppliedSeq
+		}
+		return EnqueueResult{Status: "forbidden", AppliedSeq: applied}
+	}
+	if in.Seq <= owner.AppliedSeq {
+		return EnqueueResult{Status: "stale", AppliedSeq: owner.AppliedSeq}
+	}
+	if ri.hasBufferedLocked(in.CharID, in.Seq) {
+		return EnqueueResult{Status: "stale", AppliedSeq: owner.AppliedSeq}
+	}
+	if persist {
+		if err := ri.journal.Append(queuedJournalEntry{Type: "queued", Input: in}); err != nil {
+			panic(fmt.Errorf("room %s queued input journal append: %w", ri.ID, err))
+		}
+	}
+	ri.admitLocked(in)
 	ri.lastActive = time.Now()
 	return EnqueueResult{Status: "accepted"}
+}
+
+func (ri *RoomInstance) hasBufferedLocked(charID string, seq int64) bool {
+	if ri.seen[charID] != nil {
+		if _, ok := ri.seen[charID][seq]; ok {
+			return true
+		}
+	}
+	for _, in := range ri.pending {
+		if in.CharID == charID && in.Seq == seq {
+			return true
+		}
+	}
+	return ri.waiting[charID] != nil && ri.waiting[charID][seq].Seq == seq
+}
+
+func (ri *RoomInstance) admitLocked(in game.Input) {
+	if highest := ri.admitted[in.CharID]; in.Seq > highest {
+		ri.admitted[in.CharID] = in.Seq
+	}
+	if in.Seq != ri.nextExpectedLocked(in.CharID) {
+		ri.markSeenLocked(in.CharID, in.Seq)
+		if ri.waiting == nil {
+			ri.waiting = map[string]map[int64]game.Input{}
+		}
+		if ri.waiting[in.CharID] == nil {
+			ri.waiting[in.CharID] = map[int64]game.Input{}
+		}
+		ri.waiting[in.CharID][in.Seq] = in
+		return
+	}
+	ri.pending = append(ri.pending, in)
+	ri.markSeenLocked(in.CharID, in.Seq)
+	for {
+		nextSeq := ri.nextExpectedLocked(in.CharID)
+		queued, ok := ri.waiting[in.CharID][nextSeq]
+		if !ok {
+			return
+		}
+		delete(ri.waiting[in.CharID], nextSeq)
+		ri.pending = append(ri.pending, queued)
+		ri.markSeenLocked(in.CharID, nextSeq)
+	}
+}
+
+func (ri *RoomInstance) markSeenLocked(charID string, seq int64) {
+	if ri.seen == nil {
+		ri.seen = map[string]map[int64]struct{}{}
+	}
+	if ri.seen[charID] == nil {
+		ri.seen[charID] = map[int64]struct{}{}
+	}
+	ri.seen[charID][seq] = struct{}{}
+}
+
+func (ri *RoomInstance) nextExpectedLocked(charID string) int64 {
+	applied := int64(0)
+	for _, ch := range ri.Chars {
+		if ch.ID == charID {
+			applied = ch.AppliedSeq
+		}
+	}
+	nextSeq := applied + 1
+	for _, in := range ri.pending {
+		if in.CharID == charID && in.Seq == nextSeq {
+			nextSeq++
+		}
+	}
+	return nextSeq
 }
 
 // runTick advances the authority exactly once and persists/publishes result.
@@ -108,20 +198,21 @@ func (ri *RoomInstance) runTick() {
 	ri.lastActive = time.Now()
 	batch := ri.pending
 	ri.pending = nil
+	for _, in := range batch {
+		ri.markSeenLocked(in.CharID, in.Seq)
+	}
 	applied, snap := ri.eng.ApplyTick(batch)
 	if applied == nil {
 		applied = []game.AppliedInput{}
 	}
 	snap.Hash = snap.HashValue()
 	rejected := make([]rejectedInput, 0)
-	appliedSet := map[string]struct{}{}
 	for _, a := range applied {
-		appliedSet[a.CharID+":"+strconv.FormatInt(a.Seq, 10)] = struct{}{}
-	}
-	for _, in := range batch {
-		key := in.CharID + ":" + strconv.FormatInt(in.Seq, 10)
-		if _, ok := appliedSet[key]; !ok {
-			rejected = append(rejected, rejectedInput{Input: in, Reason: "not-applied"})
+		if !a.Accepted {
+			rejected = append(rejected, rejectedInput{
+				Input:  game.Input{SessionID: a.SessionID, CharID: a.CharID, Seq: a.Seq, Cmd: a.Cmd},
+				Reason: "blocked",
+			})
 		}
 	}
 	ev := snapshotEvent{Type: "snapshot", Snapshot: snap, Applied: applied, Rejected: rejected}
@@ -132,16 +223,14 @@ func (ri *RoomInstance) runTick() {
 	}
 	jentry.Type = "tick"
 	err := ri.journal.Append(jentry)
-	ri.publishLocked(pubMsg{id: ri.nextEvtID, payload: payload})
+	ri.publishLocked(pubMsg{id: ri.nextEvtID, tick: snap.Tick, payload: payload})
 	ri.nextEvtID++
-	subs := ri.subs
 	ri.mu.Unlock()
 	if err != nil {
 		// Persistence failure must not be papered over: the room cannot
 		// honestly claim an event log afterwards.
 		panic(fmt.Errorf("room %s journal append: %w", ri.ID, err))
 	}
-	_ = subs
 }
 
 const ringCapacity = 512
@@ -163,7 +252,7 @@ func (ri *RoomInstance) publishLocked(m pubMsg) {
 	}
 }
 
-func (ri *RoomInstance) subscribe(afterID int64) (int, chan pubMsg, []pubMsg) {
+func (ri *RoomInstance) subscribe(afterID int64, afterTick int64) (int, chan pubMsg, []pubMsg) {
 	ri.mu.Lock()
 	defer ri.mu.Unlock()
 	id := ri.nextSub
@@ -172,7 +261,7 @@ func (ri *RoomInstance) subscribe(afterID int64) (int, chan pubMsg, []pubMsg) {
 	ri.subs[id] = ch
 	bl := make([]pubMsg, 0, len(ri.ring))
 	for _, m := range ri.ring {
-		if m.id > afterID {
+		if (afterTick >= 0 && m.tick > afterTick) || (afterTick < 0 && m.id > afterID) {
 			bl = append(bl, m)
 		}
 	}
