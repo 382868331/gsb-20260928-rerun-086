@@ -6,7 +6,6 @@ package platform
 import (
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"sync"
 	"time"
 
@@ -30,8 +29,11 @@ type SessionView struct {
 }
 
 type rejectedInput struct {
-	Input  game.Input `json:"input"`
-	Reason string     `json:"reason"`
+	Tick      int64  `json:"tick"`
+	SessionID string `json:"sessionId"`
+	CharID    string `json:"charId"`
+	Seq       int64  `json:"seq"`
+	Reason    string `json:"reason"`
 }
 
 type snapshotEvent struct {
@@ -63,8 +65,7 @@ type RoomInstance struct {
 	mu         sync.Mutex
 	eng        *game.Room
 	journal    *store.Journal
-	pending    []game.Input
-	accepted   map[string]int64 // charId -> highest seq admitted (covers in-flight inputs)
+	pending    []game.Input // admitted inputs plus the deferred gap tail
 	subs       map[int]chan pubMsg
 	nextSub    int
 	ring       []pubMsg // recent SSE payloads, absolute event ids
@@ -87,14 +88,18 @@ func (ri *RoomInstance) enqueue(in game.Input) EnqueueResult {
 			if ch.OwnerSession != in.SessionID {
 				return EnqueueResult{Status: "forbidden", AppliedSeq: ch.AppliedSeq}
 			}
-			maxSeq := ch.AppliedSeq
-			if admitted, ok := ri.accepted[in.CharID]; ok && admitted > maxSeq {
-				maxSeq = admitted
-			}
-			if in.Seq <= maxSeq {
+			// Stale means seq <= authority-confirmed. Newer out-of-order inputs
+			// are admitted and buffered, so network reordering cannot drop them.
+			if in.Seq <= ch.AppliedSeq {
 				return EnqueueResult{Status: "stale", AppliedSeq: ch.AppliedSeq}
 			}
-			ri.accepted[in.CharID] = in.Seq
+			for _, p := range ri.pending {
+				// A redelivery of an already-buffered (not yet ticked) input is
+				// an idempotent ack and must not be queued a second time.
+				if p.CharID == in.CharID && p.SessionID == in.SessionID && p.Seq == in.Seq {
+					return EnqueueResult{Status: "stale", AppliedSeq: ch.AppliedSeq}
+				}
+			}
 		}
 	}
 	ri.pending = append(ri.pending, in)
@@ -108,26 +113,26 @@ func (ri *RoomInstance) runTick() {
 	ri.lastActive = time.Now()
 	batch := ri.pending
 	ri.pending = nil
-	applied, snap := ri.eng.ApplyTick(batch)
+	applied, refusedInputs, deferred, snap := ri.eng.ApplyTick(batch)
 	if applied == nil {
 		applied = []game.AppliedInput{}
 	}
+	// The gap tail waits for its missing prefix; later inputs append after it
+	// and the engine re-sorts by seq, preserving identity and relative order.
+	ri.pending = append(ri.pending, deferred...)
 	snap.Hash = snap.HashValue()
-	rejected := make([]rejectedInput, 0)
-	appliedSet := map[string]struct{}{}
-	for _, a := range applied {
-		appliedSet[a.CharID+":"+strconv.FormatInt(a.Seq, 10)] = struct{}{}
-	}
-	for _, in := range batch {
-		key := in.CharID + ":" + strconv.FormatInt(in.Seq, 10)
-		if _, ok := appliedSet[key]; !ok {
-			rejected = append(rejected, rejectedInput{Input: in, Reason: "not-applied"})
-		}
+	rejected := make([]rejectedInput, 0, len(refusedInputs))
+	journalRefused := make([]game.RefusedInput, 0, len(refusedInputs))
+	for _, f := range refusedInputs {
+		journalRefused = append(journalRefused, f)
+		rejected = append(rejected, rejectedInput{
+			Tick: f.Tick, SessionID: f.SessionID, CharID: f.CharID, Seq: f.Seq, Reason: f.Reason,
+		})
 	}
 	ev := snapshotEvent{Type: "snapshot", Snapshot: snap, Applied: applied, Rejected: rejected}
 	payload, _ := json.Marshal(ev)
 	jentry := tickJournalEntry{
-		TickRecord: game.TickRecord{Tick: snap.Tick, Inputs: applied},
+		TickRecord: game.TickRecord{Tick: snap.Tick, Inputs: applied, Refused: journalRefused},
 		Hash:       snap.Hash,
 	}
 	jentry.Type = "tick"

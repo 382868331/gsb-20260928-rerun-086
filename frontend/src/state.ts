@@ -1,4 +1,4 @@
-import type { CharState, Command, PendingInput, Snapshot } from './types';
+import type { CharState, Command, PendingInput, RefusedInput, SavedClientState, Snapshot } from './types';
 import { step, type PredConfig } from './predict';
 
 export interface ClientViewState {
@@ -13,6 +13,9 @@ export interface ClientViewState {
 	predY: number;
 	predFacing: Command;
 	lastCorrection: { fromX: number; fromY: number; toX: number; toY: number; at: number } | null;
+	// reviewed holds finished inputs kept around for prediction-vs-authority
+	// review: confirmed moves and final server refusals (with their reasons).
+	reviewed: PendingInput[];
 }
 
 export function initialView(initialAuth: ClientViewState['auth']): ClientViewState {
@@ -25,6 +28,7 @@ export function initialView(initialAuth: ClientViewState['auth']): ClientViewSta
 		predY: initialAuth[0]?.y ?? 0,
 		predFacing: initialAuth[0]?.facing ?? 'right',
 		lastCorrection: null,
+		reviewed: [],
 	};
 }
 
@@ -67,19 +71,35 @@ export function applyAuthority(
 	state: ClientViewState,
 	charId: string,
 	snap: Snapshot,
-	appliedSeqs: number[],
+	refused: RefusedInput[],
 	cfg: PredConfig,
 ): ClientViewState {
 	const chars = snap.chars ?? [];
 	const me = chars.find((c) => c.id === charId);
 	if (!me) return state;
-	// Any pending input at or below the authority's ack is finished (confirmed
-	// or executed-but-blocked). Only still-in-flight seqs are re-predicted.
-	const stillPending = state.pending.filter((p) => p.seq > me.appliedSeq);
-	const newlyConfirmed = state.pending.filter((p) => appliedSeqs.includes(p.seq));
-	newlyConfirmed.forEach((p) => {
-		p.status = 'confirmed';
-	});
+	// Split finished inputs (server ack reached them, whether executed,
+	// executed-but-blocked, or finally refused) from the still-in-flight tail.
+	// The tail keeps its local seq order and is re-predicted from the new
+	// authority base, so a partial offline refusal never reorders survivors.
+	const refusalBySeq = new Map<number, RefusedInput>();
+	for (const r of refused) {
+		if (r.charId === charId) refusalBySeq.set(r.seq, r);
+	}
+	const finished: PendingInput[] = [];
+	const stillPending: PendingInput[] = [];
+	for (const p of state.pending) {
+		if (p.seq > me.appliedSeq) {
+			stillPending.push(p);
+			continue;
+		}
+		const ref = refusalBySeq.get(p.seq);
+		const done: PendingInput = { ...p, status: ref ? 'rejected' : 'confirmed' };
+		if (ref) {
+			done.msg = refusalText(ref.reason);
+			done.reason = ref.reason;
+		}
+		finished.push(done);
+	}
 	let px = me.x;
 	let py = me.y;
 	let facing = me.facing;
@@ -110,5 +130,31 @@ export function applyAuthority(
 		predY: py,
 		predFacing: facing,
 		lastCorrection: correction,
+		reviewed: [...state.reviewed, ...finished].slice(-30),
 	};
+}
+
+// restoreView rebuilds a view from a persisted save so the pending queue, the
+// last confirmed position and the predicted layer can keep reconciling after
+// a mid-session save/reload.
+export function restoreView(saved: SavedClientState): ClientViewState {
+	const base = initialView(saved.view.auth);
+	const view: ClientViewState = {
+		...base,
+		auth: saved.view.auth,
+		tick: saved.view.tick,
+		hash: saved.view.hash,
+		pending: saved.pending.map((p) => ({ ...p })),
+		predX: saved.view.predX,
+		predY: saved.view.predY,
+		predFacing: saved.view.predFacing,
+		reviewed: [],
+	};
+	return view;
+}
+
+export function refusalText(reason: string): string {
+	if (reason === 'offline-overflow') return '离线输入超出每 tick 准入上限，权威拒绝尾部输入';
+	if (reason === 'offline-window') return '输入超出未确认窗口，权威拒绝该输入';
+	return `服务端拒绝：${reason}`;
 }

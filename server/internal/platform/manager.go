@@ -61,7 +61,6 @@ func (m *Manager) CreateRoom() (*RoomInstance, CreatedRoom, error) {
 		ID: roomID, Cfg: cfg, Chars: chars, Views: views, Sessions: sessions,
 		eng:        game.NewRoom(roomID, cfg, chars),
 		journal:    journal,
-		accepted:   map[string]int64{},
 		subs:       map[int]chan pubMsg{},
 		lastActive: time.Now(),
 	}
@@ -188,7 +187,7 @@ func (m *Manager) LoadRoom(id string) error {
 	ri := &RoomInstance{
 		ID: id, Cfg: cfg, Chars: restoredChars, Views: views, Sessions: sessions,
 		eng: restored, journal: journal,
-		accepted: map[string]int64{}, subs: map[int]chan pubMsg{}, lastActive: time.Now(),
+		subs: map[int]chan pubMsg{}, lastActive: time.Now(),
 	}
 	m.mu.Lock()
 	m.rooms[id] = ri

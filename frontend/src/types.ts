@@ -43,11 +43,21 @@ export interface AppliedInput {
 	accepted: boolean;
 }
 
+// RefusedInput is a final authority rejection of an offline input. Its seq is
+// still acknowledged (appliedSeq advances), so it can never execute later.
+export interface RefusedInput {
+	tick: number;
+	sessionId: string;
+	charId: string;
+	seq: number;
+	reason: 'offline-overflow' | 'offline-window' | string;
+}
+
 export interface SnapshotEvent {
 	type: 'snapshot';
 	snapshot: Snapshot;
 	applied: AppliedInput[];
-	rejected?: { input: { sessionId: string; charId: string; seq: number; cmd: Command }; reason: string }[];
+	rejected?: RefusedInput[];
 }
 
 export interface EnqueueResult {
@@ -69,8 +79,30 @@ export interface PendingInput {
 	seq: number;
 	cmd: Command;
 	sentAt: number;
-	status: 'predicting' | 'confirmed' | 'rejected' | 'duplicate' | 'forbidden' | 'error';
+	status: 'predicting' | 'confirmed' | 'rejected' | 'duplicate' | 'forbidden' | 'error' | 'queued';
 	predX: number;
 	predY: number;
 	msg?: string;
+	reason?: string;
+}
+
+// SavedClientState is persisted so a save/reload mid-session can continue
+// reconciling the same pending queue, ack position and predicted layer.
+export interface SavedClientState {
+	version: 1;
+	roomId: string;
+	sessionId: string;
+	charId: string;
+	nextSeq: number;
+	confirmedSeq: number;
+	pending: PendingInput[];
+	view: {
+		tick: number;
+		hash: string;
+		predX: number;
+		predY: number;
+		predFacing: Command;
+		auth: CharState[];
+	};
+	savedAt: number;
 }

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { createRoom, runReplay, type ChaosConfig, defaultChaos } from './api';
+import { createRoom, fetchRoom, runReplay, type ChaosConfig, defaultChaos } from './api';
+import { loadRoom, saveRoom } from './roomStorage';
 import { ClientPanel } from './ClientPanel';
 import type { ReplayResult, RoomInfo } from './types';
 
@@ -26,10 +27,18 @@ export default function App() {
 	}
 
 	useEffect(() => {
-		createRoom()
+		const saved = loadRoom();
+		const boot = saved ? fetchRoom(saved.roomId).catch(() => createRoom()) : createRoom();
+		boot
 			.then((info) => {
 				setRoom(info);
-				pushLog(`房间已创建：${info.roomId}（两个角色、两个会话）`, 'ok');
+				saveRoom(info);
+				pushLog(
+					saved && saved.roomId === info.roomId
+						? `已恢复房间 ${info.roomId}（从权威日志加载，客户端本地保存继续核对）`
+						: `房间已创建：${info.roomId}（两个角色、两个会话）`,
+					'ok',
+				);
 			})
 			.catch((e) => setError(`无法连接 Go 权威服务：${String(e)}`));
 	}, []);

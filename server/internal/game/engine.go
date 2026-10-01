@@ -79,11 +79,42 @@ type AppliedInput struct {
 	Accepted  bool    `json:"accepted"`
 }
 
+// RefusedInput records an input the authority deliberately refused instead
+// of executing. A refused seq still advances AppliedSeq: it is a final
+// authority decision, so a later redelivery is stale and can never mutate
+// state a second time.
+//
+// Reasons:
+//   - "offline-overflow": more than MaxAdmittedPerTick contiguous inputs of
+//     one session reached the same tick (the tail of an offline burst);
+//   - "offline-window": the seq jumped ahead of the still-unacked window and
+//     the missing prefix can no longer be waited for.
+type RefusedInput struct {
+	Tick      int64  `json:"tick"`
+	SessionID string `json:"sessionId"`
+	CharID    string `json:"charId"`
+	Seq       int64  `json:"seq"`
+	Reason    string `json:"reason"`
+}
+
+const (
+	// MaxAdmittedPerTick bounds how many contiguous inputs of one session are
+	// executed in a single authority tick. Everything contiguous beyond it is
+	// refused as an offline burst so the authority never silently replays an
+	// unbounded client backlog.
+	MaxAdmittedPerTick = 4
+	// MaxPendingGap bounds how far ahead of AppliedSeq an out-of-order input
+	// may be while waiting for its missing prefix. Beyond it the input is
+	// refused instead of stalling the session forever.
+	MaxPendingGap = 8
+)
+
 // TickRecord is one deterministic append-only event in the room journal.
 type TickRecord struct {
-	Type   string         `json:"type"` // always "tick"
-	Tick   int64          `json:"tick"`
-	Inputs []AppliedInput `json:"inputs"`
+	Type    string         `json:"type"` // always "tick"
+	Tick    int64          `json:"tick"`
+	Inputs  []AppliedInput `json:"inputs"`
+	Refused []RefusedInput `json:"refused,omitempty"`
 }
 
 type Room struct {
@@ -123,55 +154,106 @@ func (r *Room) IsStale(in Input) bool {
 }
 
 // ApplyTick processes one ordered batch of inputs and advances the clock.
-// Inputs within the batch are executed in character declaration order and
-// then seq order, which is the same order used during replay.
-func (r *Room) ApplyTick(inputs []Input) ([]AppliedInput, Snapshot) {
+// Inputs are executed in character declaration order and then seq order, the
+// same order used during replay.
+//
+// Besides executed inputs it returns:
+//   - refused: final rejections (overflow / gap window), already acked;
+//   - deferred: inputs that arrived ahead of a missing seq prefix; the
+//     caller must feed them back into a later tick, their relative order and
+//     identity preserved.
+func (r *Room) ApplyTick(inputs []Input) (applied []AppliedInput, refused []RefusedInput, deferred []Input, snap Snapshot) {
 	r.Tick++
-	sort.SliceStable(inputs, func(i, j int) bool {
-		ti, tj := r.charIndex(inputs[i].CharID), r.charIndex(inputs[j].CharID)
-		if ti != tj {
-			return ti < tj
+	applied = make([]AppliedInput, 0, len(inputs))
+	refused = make([]RefusedInput, 0)
+	deferred = make([]Input, 0)
+	for _, c := range r.Chars {
+		mine := make([]Input, 0, len(inputs))
+		seen := map[int64]struct{}{}
+		for _, in := range inputs {
+			if in.CharID != c.ID || in.SessionID != c.OwnerSession {
+				continue
+			}
+			if in.Seq <= c.AppliedSeq {
+				// Idempotency: a confirmed-old or duplicated late input is
+				// dropped before touching any state.
+				continue
+			}
+			if _, dup := seen[in.Seq]; dup {
+				continue
+			}
+			seen[in.Seq] = struct{}{}
+			mine = append(mine, in)
 		}
-		return inputs[i].Seq < inputs[j].Seq
-	})
-	applied := make([]AppliedInput, 0, len(inputs))
-	for _, in := range inputs {
-		c := r.byID[in.CharID]
-		if c == nil || c.OwnerSession != in.SessionID {
-			// Input for an unknown character or from a non-owning session is
-			// refused before touching any state.
-			continue
+		sort.SliceStable(mine, func(i, j int) bool { return mine[i].Seq < mine[j].Seq })
+
+		budget := MaxAdmittedPerTick
+		for idx := 0; idx < len(mine); {
+			in := mine[idx]
+			expected := c.AppliedSeq + 1
+			switch {
+			case in.Seq == expected && budget > 0:
+				// Contiguous next input and admission budget left: execute.
+				applied = append(applied, r.execute(c, in))
+				c.AppliedSeq = in.Seq
+				budget--
+				idx++
+			case in.Seq == expected:
+				// Contiguous but the offline burst exceeds the per-tick
+				// admission budget. The whole contiguous tail is refused and
+				// acked; it can never execute later.
+				c.AppliedSeq = in.Seq
+				refused = append(refused, RefusedInput{
+					Tick: r.Tick, SessionID: in.SessionID, CharID: in.CharID,
+					Seq: in.Seq, Reason: "offline-overflow",
+				})
+				idx++
+			case in.Seq-c.AppliedSeq > MaxPendingGap:
+				// Jumped beyond the unacked window; refusing is final and
+				// keeps the session from stalling on a lost prefix.
+				c.AppliedSeq = in.Seq
+				refused = append(refused, RefusedInput{
+					Tick: r.Tick, SessionID: in.SessionID, CharID: in.CharID,
+					Seq: in.Seq, Reason: "offline-window",
+				})
+				idx++
+			default:
+				// Gap: an earlier seq is still in flight (delay/reorder). Keep
+				// identity and order, retry on a later tick.
+				deferred = append(deferred, mine[idx:]...)
+				idx = len(mine)
+			}
 		}
-		if in.Seq <= c.AppliedSeq {
-			// Idempotency: a late duplicate must never execute twice.
-			continue
-		}
-		c.AppliedSeq = in.Seq
-		rec := AppliedInput{
-			Tick: r.Tick, SessionID: in.SessionID, CharID: in.CharID,
-			Seq: in.Seq, Cmd: in.Cmd,
-		}
-		if in.Cmd != CmdWait {
-			c.Facing = in.Cmd
-		}
-		nx, ny := c.X, c.Y
-		switch in.Cmd {
-		case CmdUp:
-			ny--
-		case CmdDown:
-			ny++
-		case CmdLeft:
-			nx--
-		case CmdRight:
-			nx++
-		}
-		if r.passable(nx, ny, c.ID) {
-			c.X, c.Y = nx, ny
-			rec.Accepted = true
-		}
-		applied = append(applied, rec)
 	}
-	return applied, r.Snapshot()
+	return applied, refused, deferred, r.Snapshot()
+}
+
+// execute applies one admitted input to its character and reports whether it
+// actually moved (a wall/collision still consumes the seq).
+func (r *Room) execute(c *Char, in Input) AppliedInput {
+	rec := AppliedInput{
+		Tick: r.Tick, SessionID: in.SessionID, CharID: in.CharID,
+		Seq: in.Seq, Cmd: in.Cmd,
+	}
+	if in.Cmd != CmdWait {
+		c.Facing = in.Cmd
+	}
+	nx, ny := c.X, c.Y
+	switch in.Cmd {
+	case CmdUp:
+		ny--
+	case CmdDown:
+		ny++
+	case CmdLeft:
+		nx--
+	case CmdRight:
+		nx++
+	}
+	if r.passable(nx, ny, c.ID) {
+		c.X, c.Y = nx, ny
+		rec.Accepted = true
+	}
+	return rec
 }
 
 func (r *Room) charIndex(id string) int {
@@ -234,18 +316,10 @@ func Replay(id string, cfg Config, initial []*Char, records []TickRecord) ([]Sna
 		if rec.Tick != r.Tick+1 {
 			return nil, fmt.Errorf("non-contiguous tick in journal: want %d got %d", r.Tick+1, rec.Tick)
 		}
-		inputs := make([]Input, 0, len(rec.Inputs))
-		for _, a := range rec.Inputs {
-			inputs = append(inputs, Input{SessionID: a.SessionID, CharID: a.CharID, Seq: a.Seq, Cmd: a.Cmd})
-		}
-		applied, snap := r.ApplyTick(inputs)
-		if len(applied) != len(rec.Inputs) {
-			return nil, fmt.Errorf("tick %d replay diverged on input count", rec.Tick)
-		}
-		for i := range applied {
-			if applied[i] != rec.Inputs[i] {
-				return nil, fmt.Errorf("tick %d replay diverged on input %d", rec.Tick, i)
-			}
+		inputs := recordInputs(rec)
+		applied, refused, deferred, snap := r.ApplyTick(inputs)
+		if err := compareTick(rec, applied, refused, deferred); err != nil {
+			return nil, fmt.Errorf("tick %d %w", rec.Tick, err)
 		}
 		snap.Hash = snap.HashValue()
 		out = append(out, snap)
@@ -266,23 +340,53 @@ func ReplayRoom(id string, cfg Config, initial []*Char, records []TickRecord) (*
 		if rec.Tick != r.Tick+1 {
 			return nil, nil, fmt.Errorf("non-contiguous tick in journal: want %d got %d", r.Tick+1, rec.Tick)
 		}
-		inputs := make([]Input, 0, len(rec.Inputs))
-		for _, a := range rec.Inputs {
-			inputs = append(inputs, Input{SessionID: a.SessionID, CharID: a.CharID, Seq: a.Seq, Cmd: a.Cmd})
-		}
-		applied, snap := r.ApplyTick(inputs)
-		if len(applied) != len(rec.Inputs) {
-			return nil, nil, fmt.Errorf("tick %d replay diverged on input count", rec.Tick)
-		}
-		for i := range applied {
-			if applied[i] != rec.Inputs[i] {
-				return nil, nil, fmt.Errorf("tick %d replay diverged on input %d", rec.Tick, i)
-			}
+		inputs := recordInputs(rec)
+		applied, refused, deferred, snap := r.ApplyTick(inputs)
+		if err := compareTick(rec, applied, refused, deferred); err != nil {
+			return nil, nil, fmt.Errorf("tick %d %w", rec.Tick, err)
 		}
 		snap.Hash = snap.HashValue()
 		out = append(out, snap)
 	}
 	return r, out, nil
+}
+
+// recordInputs rebuilds the final input set of a tick (executed and refused)
+// so replay drives the engine through exactly the same decisions.
+func recordInputs(rec TickRecord) []Input {
+	inputs := make([]Input, 0, len(rec.Inputs)+len(rec.Refused))
+	for _, a := range rec.Inputs {
+		inputs = append(inputs, Input{SessionID: a.SessionID, CharID: a.CharID, Seq: a.Seq, Cmd: a.Cmd})
+	}
+	// Refused records carry no command in the journal (the command was never
+	// executed); CmdWait is a neutral placeholder that only advances the ack.
+	for _, f := range rec.Refused {
+		inputs = append(inputs, Input{SessionID: f.SessionID, CharID: f.CharID, Seq: f.Seq, Cmd: CmdWait})
+	}
+	return inputs
+}
+
+func compareTick(rec TickRecord, applied []AppliedInput, refused []RefusedInput, deferred []Input) error {
+	if len(deferred) != 0 {
+		return fmt.Errorf("replay left inputs deferred")
+	}
+	if len(applied) != len(rec.Inputs) {
+		return fmt.Errorf("replay diverged on applied count: %d vs %d", len(applied), len(rec.Inputs))
+	}
+	for i := range applied {
+		if applied[i] != rec.Inputs[i] {
+			return fmt.Errorf("replay diverged on applied input %d", i)
+		}
+	}
+	if len(refused) != len(rec.Refused) {
+		return fmt.Errorf("replay diverged on refused count: %d vs %d", len(refused), len(rec.Refused))
+	}
+	for i := range refused {
+		if refused[i] != rec.Refused[i] {
+			return fmt.Errorf("replay diverged on refused input %d", i)
+		}
+	}
+	return nil
 }
 
 func cloneChars(in []*Char) []*Char {
