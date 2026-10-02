@@ -23,10 +23,21 @@
   - 重复送达：按概率把同一输入再投递一次，可看到服务端的 stale ack；
   - 短暂断开：断开 SSE 并串行挂起 POST，离线期间可继续形成本地输入；恢复后按本地
     seq 顺序发送，乱序到达时服务端先缓冲缺口，连续后再进入权威 tick。
-  - 保存恢复：待确认输入、最后确认水位、预测层和拒绝回看写入浏览器 localStorage；
+- 保存恢复：待确认输入、最后确认水位、预测层和拒绝回看写入浏览器 localStorage；
     页面中途刷新后会重发待确认输入并从最后权威 tick 续传。
+- 规则版本化（本轮新增）：服务端可在会话中切换动作规则（暂时封闭一片区域、
+  改变某类动作的能量消耗），每次切换版本号 +1 并作为 `rules` 事件落盘。
+  - 客户端每个输入都携带形成时所依据的 `ruleVersion`；离线期间形成的输入重连后
+    仍声明原依据，服务端逐项明确判定：按当前版本接受、拒绝（`sealed` /
+    `insufficient-energy` / `blocked`），或对"旧依据 + 新规则禁止"的输入置
+    `needsReconfirm`，由用户显式重新确认，绝不静默改写原输入。
+  - 拒绝一项后其余输入仍按原 seq 顺序处理，依赖被否决动作的后续输入各自获得
+    独立理由；页面展示规则切换前的预测、逐项确认结果与最终状态差异，预测修正
+    不会抹掉原规则依据与拒绝记录。
+  - 含待确认输入的会话可保存后重开，迟到确认按原规则依据继续结算；规则切换、
+    重复送达与部分确认的组合都与权威重放逐 tick 对 hash。
 - 事件保存与重放：有输入的 tick 追加为 `tick`，已入站但尚未执行的缺口输入追加为
-  `queued`，文件位于 `server/data/<room>.jsonl`。重放接口纯靠日志重建全部快照并与
+  `queued`，规则切换追加为 `rules`，文件位于 `server/data/<room>.jsonl`。重放接口纯靠日志重建全部快照并与
   实时记录逐 tick 比对 hash；重启后 `LoadRoom` 先重放已确认 tick，再恢复仍未执行的
   `queued` 输入，tick 编号不会回绕。
 
@@ -54,8 +65,10 @@ cd frontend && npm run dev
 
 - `POST /api/rooms` → `{ roomId, config, chars, sessions }`（sessions 即两个角色的会话凭据）
 - `GET  /api/rooms/{id}/events`：SSE，支持 `Last-Event-ID` / `?after=N`，以及跨重启的 `?afterTick=N`
-- `POST /api/rooms/{id}/inputs`：`{ sessionId, charId, seq, cmd }`，
+- `POST /api/rooms/{id}/inputs`：`{ sessionId, charId, seq, cmd, ruleVersion }`，
   返回 `202 accepted` / `200 stale` / `403 forbidden`
+- `POST /api/rooms/{id}/rules`：`{ sealed: [[x,y]...], costs: {up:1,...} }`，
+  切换新版本规则（下一 tick 生效并落盘），SSE 快照携带当前 `rules` 与逐项判定理由
 - `POST /api/rooms/{id}/replay`：从落盘事件重放并返回 hash 比对结果
 - `GET  /api/rooms/{id}/journal`：原始 JSONL
 

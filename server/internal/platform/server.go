@@ -25,6 +25,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/rooms/{id}", s.getRoom)
 	mux.HandleFunc("GET /api/rooms/{id}/events", s.events)
 	mux.HandleFunc("POST /api/rooms/{id}/inputs", s.postInput)
+	mux.HandleFunc("POST /api/rooms/{id}/rules", s.postRules)
 	mux.HandleFunc("GET /api/rooms/{id}/journal", s.journal)
 	mux.HandleFunc("POST /api/rooms/{id}/replay", s.replay)
 	return withCommonHeaders(mux)
@@ -62,6 +63,7 @@ type roomInfoResponse struct {
 	Chars    []CharView    `json:"chars"`
 	Sessions []SessionView `json:"sessions"`
 	Snapshot game.Snapshot `json:"snapshot"`
+	Rules    game.Rules    `json:"rules"`
 }
 
 func (s *Server) getRoom(w http.ResponseWriter, r *http.Request) {
@@ -72,8 +74,50 @@ func (s *Server) getRoom(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, roomInfoResponse{
 		RoomID: ri.ID, Config: ri.Cfg, Chars: ri.Views,
-		Sessions: ri.Sessions, Snapshot: ri.snapshot(),
+		Sessions: ri.Sessions, Snapshot: ri.snapshot(), Rules: ri.rules(),
 	})
+}
+
+type rulesRequest struct {
+	Sealed [][2]int             `json:"sealed"`
+	Costs  map[game.Command]int `json:"costs"`
+}
+
+// postRules switches the room's action rules to a new version (e.g. seal a
+// region or change an action's energy cost). The switch is journaled and
+// takes effect at the next tick; inputs formed under older versions keep
+// their declared basis and are judged explicitly against the new version.
+func (s *Server) postRules(w http.ResponseWriter, r *http.Request) {
+	ri, err := s.roomOrLoad(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, 404, "room not found")
+		return
+	}
+	var req rulesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	for _, cell := range req.Sealed {
+		if cell[0] < 0 || cell[1] < 0 || cell[0] >= ri.Cfg.Width || cell[1] >= ri.Cfg.Height {
+			writeErr(w, 400, "sealed cell out of bounds")
+			return
+		}
+	}
+	for cmd, cost := range req.Costs {
+		switch cmd {
+		case game.CmdUp, game.CmdDown, game.CmdLeft, game.CmdRight, game.CmdWait:
+		default:
+			writeErr(w, 400, "unknown command in costs")
+			return
+		}
+		if cost < 0 {
+			writeErr(w, 400, "cost must be >= 0")
+			return
+		}
+	}
+	rules := ri.SwitchRules(req.Sealed, req.Costs)
+	writeJSON(w, 200, rules)
 }
 
 func (s *Server) roomOrLoad(id string) (*RoomInstance, error) {
@@ -92,6 +136,8 @@ type inputRequest struct {
 	CharID    string       `json:"charId"`
 	Seq       int64        `json:"seq"`
 	Cmd       game.Command `json:"cmd"`
+	// RuleVersion is the rules version the client based this input on.
+	RuleVersion int `json:"ruleVersion"`
 }
 
 func (s *Server) postInput(w http.ResponseWriter, r *http.Request) {
@@ -121,6 +167,7 @@ func (s *Server) postInput(w http.ResponseWriter, r *http.Request) {
 	}
 	res := ri.enqueue(game.Input{
 		SessionID: req.SessionID, CharID: req.CharID, Seq: req.Seq, Cmd: req.Cmd,
+		RuleVersion: req.RuleVersion,
 	})
 	code := 202
 	if res.Status == "forbidden" {
@@ -246,7 +293,7 @@ func (s *Server) journal(w http.ResponseWriter, r *http.Request) {
 func ReplayFromDisk(dir, id string) (replayResponse, error) {
 	var (
 		initEntry  store.InitEntry
-		records    []game.TickRecord
+		events     []game.JournalEvent
 		liveHashes []string
 	)
 	err := store.ReadEntries(dir, id, func(line []byte) error {
@@ -271,8 +318,16 @@ func ReplayFromDisk(dir, id string) (replayResponse, error) {
 			if err := json.Unmarshal(line, &e); err != nil {
 				return err
 			}
-			records = append(records, e.TickRecord)
+			rec := e.TickRecord
+			events = append(events, game.JournalEvent{Tick: &rec})
 			liveHashes = append(liveHashes, e.Hash)
+		case "rules":
+			var e game.RulesRecord
+			if err := json.Unmarshal(line, &e); err != nil {
+				return err
+			}
+			rec := e
+			events = append(events, game.JournalEvent{Rules: &rec})
 		}
 		return nil
 	})
@@ -290,7 +345,7 @@ func ReplayFromDisk(dir, id string) (replayResponse, error) {
 	if err := json.Unmarshal(initEntry.Chars, &chars); err != nil {
 		return replayResponse{}, err
 	}
-	snaps, err := game.Replay(id, cfg, chars, records)
+	_, snaps, err := game.ReplayJournal(id, cfg, chars, events)
 	if err != nil {
 		return replayResponse{RoomID: id, Errors: []string{err.Error()}}, nil
 	}

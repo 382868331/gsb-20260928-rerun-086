@@ -1,7 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
-import { createRoom, runReplay, type ChaosConfig, defaultChaos } from './api';
+import { changeRules, createRoom, runReplay, type ChaosConfig, defaultChaos } from './api';
 import { ClientPanel } from './ClientPanel';
-import type { ReplayResult, RoomInfo } from './types';
+import type { Command, ReplayResult, RoomInfo } from './types';
+
+// Demo rule presets: seal a corridor and/or raise movement cost.
+const SEAL_REGION: [number, number][] = [
+	[6, 3], [6, 4], [6, 5], [6, 6], [7, 4], [7, 5],
+];
+const NORMAL_COSTS: Record<Command, number> = { up: 1, down: 1, left: 1, right: 1, wait: 0 };
+const COSTLY_COSTS: Record<Command, number> = { up: 5, down: 5, left: 5, right: 5, wait: 0 };
 
 interface LogLine {
 	id: number;
@@ -54,6 +61,19 @@ export default function App() {
 		);
 	}
 
+	async function switchRules(sealed: [number, number][], costs: Record<Command, number>, label: string) {
+		if (!room) return;
+		try {
+			const rules = await changeRules(room.roomId, sealed, costs);
+			pushLog(
+				`规则切换为 v${rules.version}（${label}）：封闭 ${rules.sealed?.length ?? 0} 格，移动消耗 ${rules.costs.right ?? 1}；旧依据输入将由服务端逐项判定`,
+				'warn',
+			);
+		} catch (e) {
+			pushLog(`规则切换失败：${String(e)}`, 'warn');
+		}
+	}
+
 	if (error) {
 		return <div className="fatal">{error}<br />请先启动 Go 服务：<code>go run ./cmd/server</code></div>;
 	}
@@ -100,6 +120,11 @@ export default function App() {
 						<input type="checkbox" checked={autoReplay} onChange={(e) => setAutoReplay(e.target.checked)} />
 						每 4 秒自动校验
 					</label>
+				</div>
+				<div className="control-group replay-group">
+					<button onClick={() => switchRules(SEAL_REGION, NORMAL_COSTS, '暂时封闭中部区域')}>封闭一段区域</button>
+					<button onClick={() => switchRules([], COSTLY_COSTS, '移动消耗 ×5')}>提高移动消耗</button>
+					<button onClick={() => switchRules([], NORMAL_COSTS, '恢复默认规则')}>恢复默认规则</button>
 				</div>
 			</section>
 

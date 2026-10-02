@@ -1,4 +1,4 @@
-import type { AppliedInput, CharState, Command, PendingInput, RejectedInput, Snapshot } from './types';
+import type { AppliedInput, CharState, Command, PendingInput, RejectedInput, Rules, Snapshot } from './types';
 import { step, type PredConfig } from './predict';
 
 export interface ClientViewState {
@@ -6,6 +6,8 @@ export interface ClientViewState {
 	auth: CharState[];
 	tick: number;
 	hash: string;
+	// rules version the authority currently applies (learned from events)
+	rules: Rules;
 	// local pending inputs (predicted, not yet confirmed)
 	pending: PendingInput[];
 	// predicted position of the locally owned character (last unacked layer)
@@ -16,11 +18,12 @@ export interface ClientViewState {
 	lastCorrection: { fromX: number; fromY: number; toX: number; toY: number; at: number } | null;
 }
 
-export function initialView(initialAuth: ClientViewState['auth']): ClientViewState {
+export function initialView(initialAuth: ClientViewState['auth'], rules?: Rules): ClientViewState {
 	return {
 		auth: initialAuth,
 		tick: 0,
 		hash: '',
+		rules: rules ?? { version: 1, costs: {} },
 		pending: [],
 		predX: initialAuth[0]?.x ?? 0,
 		predY: initialAuth[0]?.y ?? 0,
@@ -40,10 +43,11 @@ export function applyLocalInput(
 ): ClientViewState {
 	const me = state.auth.find((c) => c.id === charId);
 	if (!me) return state;
+	const effCfg = { ...cfg, sealed: state.rules.sealed };
 	const baseX = state.pending.length ? state.predX : me.x;
 	const baseY = state.pending.length ? state.predY : me.y;
 	const others = state.auth.filter((c) => c.id !== charId).map((c) => ({ x: c.x, y: c.y }));
-	const next = step(baseX, baseY, cmd, others, cfg);
+	const next = step(baseX, baseY, cmd, others, effCfg);
 	const facing = cmd === 'wait' ? state.predFacing : cmd;
 	const item: PendingInput = {
 		seq,
@@ -52,6 +56,7 @@ export function applyLocalInput(
 		status: 'predicting',
 		predX: next.x,
 		predY: next.y,
+		ruleVersion: state.rules.version,
 	};
 	return {
 		...state,
@@ -71,10 +76,13 @@ export function applyAuthority(
 	snap: Snapshot,
 	applied: AppliedInput[],
 	cfg: PredConfig,
+	rules?: Rules,
 ): ClientViewState {
 	const chars = snap.chars ?? [];
 	const me = chars.find((c) => c.id === charId);
 	if (!me || snap.tick < state.tick) return state;
+	const nextRules = rules ?? state.rules;
+	const effCfg = { ...cfg, sealed: nextRules.sealed };
 	// Any pending input at or below the authority's ack is finished (confirmed
 	// or executed-but-blocked). Only still-in-flight seqs are re-predicted.
 	const stillPending = state.pending.filter((p) => p.seq > me.appliedSeq);
@@ -90,18 +98,21 @@ export function applyAuthority(
 		const p = pendingBySeq.get(rec.seq);
 		if (!p) continue;
 		const others = chars.filter((c) => c.id !== charId).map((c) => ({ x: c.x, y: c.y }));
-		const projected = step(authorityTailX, authorityTailY, p.cmd, others, cfg);
+		const projected = step(authorityTailX, authorityTailY, p.cmd, others, effCfg);
 		if (!rec.accepted) {
 			if (p.predX !== authorityTailX || p.predY !== authorityTailY) {
 				correction = { fromX: p.predX, fromY: p.predY, toX: authorityTailX, toY: authorityTailY, at: Date.now() };
 			}
+			const reason = rec.reason ?? 'blocked';
 			rejectedInputs.push({
 				...p,
 				status: 'rejected',
 				finalX: authorityTailX,
 				finalY: authorityTailY,
-				reason: 'blocked',
-				msg: `预测 (${p.predX},${p.predY})，权威最终 (${authorityTailX},${authorityTailY})`,
+				reason,
+				appliedRuleVersion: rec.appliedRuleVersion,
+				needsReconfirm: rec.needsReconfirm,
+				msg: `依据 v${p.ruleVersion} 预测 (${p.predX},${p.predY})，权威按 v${rec.appliedRuleVersion ?? p.ruleVersion} 判定${reasonLabel(reason)}，最终 (${authorityTailX},${authorityTailY})`,
 			});
 		} else {
 			authorityTailX = projected.x;
@@ -120,10 +131,12 @@ export function applyAuthority(
 	let facing = me.facing;
 	for (const p of stillPending) {
 		const others = chars.filter((c) => c.id !== charId).map((c) => ({ x: c.x, y: c.y }));
-		const n = step(px, py, p.cmd, others, cfg);
+		const n = step(px, py, p.cmd, others, effCfg);
 		px = n.x;
 		py = n.y;
 		if (p.cmd !== 'wait') facing = p.cmd;
+		// Re-predicted for rendering only: p.ruleVersion keeps the original
+		// rule basis so the correction never erases it.
 		p.predX = px;
 		p.predY = py;
 	}
@@ -135,6 +148,7 @@ export function applyAuthority(
 		auth: chars,
 		tick: snap.tick,
 		hash: snap.hash,
+		rules: nextRules,
 		pending: stillPending,
 		predX: px,
 		predY: py,
@@ -142,6 +156,17 @@ export function applyAuthority(
 		rejectedInputs,
 		lastCorrection: correction,
 	};
+}
+
+export function reasonLabel(reason: string): string {
+	switch (reason) {
+		case 'sealed':
+			return '拒绝（区域已封闭）';
+		case 'insufficient-energy':
+			return '拒绝（能量不足）';
+		default:
+			return '阻挡';
+	}
 }
 
 export function persistenceKey(roomId: string, charId: string): string {
@@ -155,6 +180,7 @@ export function saveView(roomId: string, charId: string, state: ClientViewState,
 			auth: state.auth,
 			tick: state.tick,
 			hash: state.hash,
+			rules: state.rules,
 			pending: state.pending,
 			predX: state.predX,
 			predY: state.predY,
@@ -172,6 +198,7 @@ export function loadView(roomId: string, charId: string): { view: ClientViewStat
 		const parsed = JSON.parse(raw) as { nextSeq: number; view: ClientViewState };
 		if (!Array.isArray(parsed.view?.auth) || !Array.isArray(parsed.view?.pending)) return null;
 		parsed.view.rejectedInputs ??= [];
+		parsed.view.rules ??= { version: 1, costs: {} };
 		parsed.view.lastCorrection = null;
 		return parsed;
 	} catch {

@@ -140,3 +140,87 @@ describe('client prediction and authority reconciliation', () => {
 		expect([restored?.view.predX ?? 0, restored?.view.predY ?? 0]).toEqual([2, 1]);
 	});
 });
+
+describe('rule versioning', () => {
+	it('predicts around sealed cells of the current rules', () => {
+		const s0 = { ...start(), rules: { version: 2, sealed: [[2, 1]] as [number, number][], costs: {} } };
+		const s = applyLocalInput(s0, 'c1', 1, 'right', cfg);
+		// (2,1) is sealed under v2: prediction stays put, basis recorded as v2.
+		expect([s.predX, s.predY]).toEqual([1, 1]);
+		expect(s.pending[0].ruleVersion).toBe(2);
+	});
+
+	it('keeps the original rule basis on pending inputs across a rule switch', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'right', cfg); // formed under v1
+		const snap: Snapshot = {
+			tick: 1,
+			hash: 'h-rules',
+			chars: [
+				{ id: 'c1', x: 1, y: 1, facing: 'right', appliedSeq: 0 },
+				{ id: 'c2', x: 4, y: 1, facing: 'left', appliedSeq: 0 },
+			],
+		};
+		// Heartbeat carries the new rules; the pending input keeps basis v1.
+		s = applyAuthority(s, 'c1', snap, [], cfg, { version: 2, sealed: [[2, 1]], costs: {} });
+		expect(s.rules.version).toBe(2);
+		expect(s.pending[0].ruleVersion).toBe(1);
+	});
+
+	it('records rejection with reason, applied version and reconfirm flag', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'right', cfg); // basis v1, predicts (2,1)
+		const snap: Snapshot = {
+			tick: 1,
+			hash: 'h-sealed',
+			chars: [
+				{ id: 'c1', x: 1, y: 1, facing: 'right', appliedSeq: 1 },
+				{ id: 'c2', x: 4, y: 1, facing: 'left', appliedSeq: 0 },
+			],
+		};
+		s = applyAuthority(
+			s,
+			'c1',
+			snap,
+			[{ ...applied(1, false, 1, 1), ruleVersion: 1, appliedRuleVersion: 2, reason: 'sealed', needsReconfirm: true }],
+			cfg,
+			{ version: 2, sealed: [[2, 1]], costs: {} },
+		);
+		expect(s.rejectedInputs).toHaveLength(1);
+		const rej = s.rejectedInputs[0];
+		expect(rej.ruleVersion).toBe(1);
+		expect(rej.appliedRuleVersion).toBe(2);
+		expect(rej.reason).toBe('sealed');
+		expect(rej.needsReconfirm).toBe(true);
+		expect([s.predX, s.predY]).toEqual([1, 1]);
+	});
+
+	it('save/restore keeps pending rule basis and rejected records', () => {
+		const store = new Map<string, string>();
+		vi.stubGlobal('localStorage', {
+			getItem: (key: string) => store.get(key) ?? null,
+			setItem: (key: string, value: string) => void store.set(key, value),
+		});
+		let s = applyLocalInput(start(), 'c1', 1, 'right', cfg);
+		const snap: Snapshot = {
+			tick: 1,
+			hash: 'h',
+			chars: [
+				{ id: 'c1', x: 1, y: 1, facing: 'right', appliedSeq: 1 },
+				{ id: 'c2', x: 4, y: 1, facing: 'left', appliedSeq: 0 },
+			],
+		};
+		s = applyAuthority(
+			s,
+			'c1',
+			snap,
+			[{ ...applied(1, false, 1, 1), ruleVersion: 1, appliedRuleVersion: 2, reason: 'sealed', needsReconfirm: true }],
+			cfg,
+			{ version: 2, sealed: [[2, 1]], costs: {} },
+		);
+		s = applyLocalInput(s, 'c1', 2, 'up', cfg); // new input under v2
+		saveView('room-rules', 'c1', s, 2);
+		const restored = loadView('room-rules', 'c1');
+		expect(restored?.view.rules.version).toBe(2);
+		expect(restored?.view.pending[0].ruleVersion).toBe(2);
+		expect(restored?.view.rejectedInputs[0].needsReconfirm).toBe(true);
+	});
+});

@@ -8,6 +8,8 @@ export interface PredConfig {
 	width: number;
 	height: number;
 	obstacles: [number, number][];
+	// Cells temporarily sealed by the current rules version.
+	sealed?: [number, number][];
 }
 
 export function step(
@@ -25,6 +27,7 @@ export function step(
 	else if (cmd === 'right') nx++;
 	if (nx < 0 || ny < 0 || nx >= cfg.width || ny >= cfg.height) return { x, y, moved: false };
 	if (cfg.obstacles.some(([ox, oy]) => ox === nx && oy === ny)) return { x, y, moved: false };
+	if (cfg.sealed?.some(([sx, sy]) => sx === nx && sy === ny)) return { x, y, moved: false };
 	if (others.some((o) => o.x === nx && o.y === ny)) return { x, y, moved: false };
 	return { x: nx, y: ny, moved: true };
 }

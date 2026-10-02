@@ -26,6 +26,7 @@ type CreatedRoom struct {
 	Config   game.Config   `json:"config"`
 	Chars    []CharView    `json:"chars"`
 	Sessions []SessionView `json:"sessions"`
+	Rules    game.Rules    `json:"rules"`
 }
 
 var ErrNotFound = errors.New("room not found")
@@ -70,7 +71,7 @@ func (m *Manager) CreateRoom() (*RoomInstance, CreatedRoom, error) {
 	m.rooms[roomID] = ri
 	m.mu.Unlock()
 	go m.tickLoop(ri)
-	return ri, CreatedRoom{ID: roomID, Config: cfg, Chars: views, Sessions: sessions}, nil
+	return ri, CreatedRoom{ID: roomID, Config: cfg, Chars: views, Sessions: sessions, Rules: ri.eng.Rules}, nil
 }
 
 func (m *Manager) tickLoop(ri *RoomInstance) {
@@ -99,7 +100,7 @@ func (m *Manager) tickLoop(ri *RoomInstance) {
 		snap.Hash = snap.HashValue()
 		// Applied must serialize as [] not null: idle heartbeats reach the
 		// client too, and a null field crashes the snapshot folding there.
-		ev := snapshotEvent{Type: "snapshot", Snapshot: snap, Applied: []game.AppliedInput{}}
+		ev := snapshotEvent{Type: "snapshot", Snapshot: snap, Applied: []game.AppliedInput{}, Rules: ri.eng.Rules}
 		payload, _ := json.Marshal(ev)
 		ri.publishLocked(pubMsg{id: ri.nextEvtID, tick: snap.Tick, payload: payload})
 		ringsNext := ri.nextEvtID
@@ -134,7 +135,7 @@ func (m *Manager) Get(id string) (*RoomInstance, error) {
 func (m *Manager) LoadRoom(id string) error {
 	var (
 		initEntry store.InitEntry
-		records   []game.TickRecord
+		events    []game.JournalEvent
 		queued    []game.Input
 	)
 	err := store.ReadEntries(m.dir, id, func(line []byte) error {
@@ -156,7 +157,15 @@ func (m *Manager) LoadRoom(id string) error {
 			if err := json.Unmarshal(line, &e); err != nil {
 				return err
 			}
-			records = append(records, e.TickRecord)
+			rec := e.TickRecord
+			events = append(events, game.JournalEvent{Tick: &rec})
+		case "rules":
+			var e game.RulesRecord
+			if err := json.Unmarshal(line, &e); err != nil {
+				return err
+			}
+			rec := e
+			events = append(events, game.JournalEvent{Rules: &rec})
 		case "queued":
 			var e queuedJournalEntry
 			if err := json.Unmarshal(line, &e); err != nil {
@@ -177,13 +186,18 @@ func (m *Manager) LoadRoom(id string) error {
 	if err := json.Unmarshal(initEntry.Chars, &chars); err != nil {
 		return err
 	}
-	restored, _, err := game.ReplayRoom(id, cfg, chars, records)
+	restored, _, err := game.ReplayJournal(id, cfg, chars, events)
 	if err != nil {
 		return err
 	}
 	appliedSeen := map[string]map[int64]struct{}{}
-	for _, rec := range records {
-		for _, in := range rec.Inputs {
+	nTicks := 0
+	for _, ev := range events {
+		if ev.Tick == nil {
+			continue
+		}
+		nTicks++
+		for _, in := range ev.Tick.Inputs {
 			if appliedSeen[in.CharID] == nil {
 				appliedSeen[in.CharID] = map[int64]struct{}{}
 			}
@@ -220,7 +234,7 @@ func (m *Manager) LoadRoom(id string) error {
 		ID: id, Cfg: cfg, Chars: restoredChars, Views: views, Sessions: sessions,
 		eng: restored, journal: journal,
 		admitted: map[string]int64{}, waiting: map[string]map[int64]game.Input{},
-		subs: map[int]chan pubMsg{}, nextEvtID: int64(len(records)), lastActive: time.Now(),
+		subs: map[int]chan pubMsg{}, nextEvtID: int64(nTicks), lastActive: time.Now(),
 	}
 	for _, in := range liveQueued {
 		ri.enqueueLocked(in, false)

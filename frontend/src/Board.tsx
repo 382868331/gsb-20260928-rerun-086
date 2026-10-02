@@ -4,6 +4,7 @@ interface BoardProps {
 	width: number;
 	height: number;
 	obstacles: [number, number][];
+	sealed: [number, number][];
 	chars: CharMeta[];
 	states: CharState[];
 	localCharId: string;
@@ -23,13 +24,19 @@ const arrow: Record<Command, string> = {
 };
 
 export function Board(props: BoardProps) {
-	const { width, height, obstacles, chars, states } = props;
+	const { width, height, obstacles, sealed, chars, states } = props;
 	const wall = new Set(obstacles.map(([x, y]) => `${x},${y}`));
+	const sealedSet = new Set(sealed.map(([x, y]) => `${x},${y}`));
 	const cells = [];
 	for (let y = 0; y < height; y++) {
 		for (let x = 0; x < width; x++) {
+			const key = `${x},${y}`;
 			cells.push(
-				<div key={`${x},${y}`} className={`cell ${wall.has(`${x},${y}`) ? 'wall' : ''}`} />,
+				<div
+					key={key}
+					className={`cell ${wall.has(key) ? 'wall' : ''} ${sealedSet.has(key) ? 'sealed' : ''}`}
+					title={sealedSet.has(key) ? '当前规则下暂时封闭' : undefined}
+				/>,
 			);
 		}
 	}

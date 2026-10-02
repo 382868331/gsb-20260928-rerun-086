@@ -18,6 +18,14 @@ export interface RoomInfo {
 	config: { width: number; height: number; obstacles: [number, number][] };
 	chars: CharMeta[];
 	sessions: SessionInfo[];
+	rules: Rules;
+}
+
+// Rules is one versioned set of action rules decided by the authority.
+export interface Rules {
+	version: number;
+	sealed?: [number, number][];
+	costs: Partial<Record<Command, number>>;
 }
 
 export interface CharState {
@@ -25,6 +33,7 @@ export interface CharState {
 	x: number;
 	y: number;
 	facing: Command;
+	energy?: number;
 	appliedSeq: number;
 }
 
@@ -43,18 +52,25 @@ export interface AppliedInput {
 	accepted: boolean;
 	x: number;
 	y: number;
+	// Basis declared by the client vs. version the authority applied.
+	ruleVersion?: number;
+	appliedRuleVersion?: number;
+	reason?: 'blocked' | 'sealed' | 'insufficient-energy';
+	needsReconfirm?: boolean;
 }
 
 export interface SnapshotEvent {
 	type: 'snapshot';
 	snapshot: Snapshot;
 	applied: AppliedInput[];
-	rejected?: { input: { sessionId: string; charId: string; seq: number; cmd: Command }; reason: string }[];
+	rejected?: AppliedInput[];
+	rules?: Rules;
 }
 
 export interface EnqueueResult {
 	status: 'accepted' | 'stale' | 'forbidden';
 	appliedSeq: number;
+	ruleVersion?: number;
 }
 
 export interface ReplayResult {
@@ -74,6 +90,8 @@ export interface PendingInput {
 	status: 'predicting' | 'confirmed' | 'rejected' | 'duplicate' | 'forbidden' | 'error';
 	predX: number;
 	predY: number;
+	// Rules version this input was formed under; never rewritten locally.
+	ruleVersion: number;
 	msg?: string;
 }
 
@@ -81,4 +99,6 @@ export interface RejectedInput extends PendingInput {
 	finalX: number;
 	finalY: number;
 	reason: string;
+	appliedRuleVersion?: number;
+	needsReconfirm?: boolean;
 }

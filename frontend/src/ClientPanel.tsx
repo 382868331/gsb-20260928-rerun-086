@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { GameClient, type ChaosConfig, type TransportStatus } from './api';
 import { Board } from './Board';
-import { applyAuthority, applyLocalInput, initialView, loadView, saveView, type ClientViewState } from './state';
+import { applyAuthority, applyLocalInput, initialView, loadView, reasonLabel, saveView, type ClientViewState } from './state';
 import type { Command, EnqueueResult, RoomInfo, SnapshotEvent } from './types';
 
 interface Props {
@@ -34,11 +34,15 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 	const [view, setView] = useState<ClientViewState>(() => {
 		const restored = loadView(room.roomId, session.charId);
 		if (restored && restored.view.auth.some((c) => c.id === session.charId)) return restored.view;
-		return initialView(room.chars.map((c) => ({ id: c.id, x: c.x, y: c.y, facing: 'right', appliedSeq: 0 })));
+		return initialView(room.chars.map((c) => ({ id: c.id, x: c.x, y: c.y, facing: 'right', appliedSeq: 0 })), room.rules);
 	});
 	const [status, setStatus] = useState<TransportStatus>('connecting');
 	const seqRef = useRef(loadView(room.roomId, session.charId)?.nextSeq ?? 0);
 	const [notice, setNotice] = useState<string>('');
+	const rulesVersionRef = useRef(view.rules.version);
+	useEffect(() => {
+		rulesVersionRef.current = view.rules.version;
+	}, [view.rules.version]);
 	useEffect(() => {
 		saveView(room.roomId, client.charId, view, seqRef.current);
 	}, [room.roomId, client.charId, view]);
@@ -53,15 +57,22 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 		if (restored) {
 			client.lastTick = restored.view.tick;
 			restored.view.pending.forEach((p) => {
-				void client.sendInput(p.seq, p.cmd).then(({ status: code, result }) => {
+				// Late confirmations for saved inputs: resend with the ORIGINAL
+				// rule basis; the authority decides which version to apply.
+				void client.sendInput(p.seq, p.cmd, p.ruleVersion).then(({ status: code, result }) => {
 					if (code === 403) duplicateSeen(`seq=${p.seq} 恢复重发被会话校验拒绝`);
 					else if (result?.status === 'stale') duplicateSeen(`seq=${p.seq} 恢复重发命中 stale，未重复执行`);
 				});
 			});
 		}
 		const offEvt = client.onEvent((ev: SnapshotEvent) => {
+			if (ev.rules && ev.rules.version !== rulesVersionRef.current) {
+				duplicateSeen(
+					`规则已切换 v${rulesVersionRef.current} → v${ev.rules.version}（封闭 ${ev.rules.sealed?.length ?? 0} 格）；待确认输入仍保留原规则依据`,
+				);
+			}
 			setView((prev) => {
-				return applyAuthority(prev, client.charId, ev.snapshot, ev.applied ?? [], cfg);
+				return applyAuthority(prev, client.charId, ev.snapshot, ev.applied ?? [], cfg, ev.rules);
 			});
 		});
 		const offStatus = client.onStatus(setStatus);
@@ -74,13 +85,14 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 
 	async function issue(cmd: Command) {
 		const seq = ++seqRef.current;
+		const basis = rulesVersionRef.current;
 		setView((prev) => {
 			const next = applyLocalInput(prev, client.charId, seq, cmd, cfg);
 			saveView(room.roomId, client.charId, next, seqRef.current);
 			return next;
 		});
 		try {
-			const { status: code, result } = await client.sendInput(seq, cmd, (_code, dup: EnqueueResult) => {
+			const { status: code, result } = await client.sendInput(seq, cmd, basis, (_code, dup: EnqueueResult) => {
 				duplicateSeen(`重复送达 seq=${seq}：服务端幂等响应 ${dup.status}`);
 			});
 			if (code === 403) {
@@ -103,7 +115,7 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 	function sendStale() {
 		// Manually redeliver the very first input again to prove idempotency.
 		const seq = Math.max(1, seqRef.current);
-		client.sendInput(seq, 'right', (_c, r) => duplicateSeen(`手动重发 seq=${seq}：${r.status}`));
+		client.sendInput(seq, 'right', rulesVersionRef.current, (_c, r) => duplicateSeen(`手动重发 seq=${seq}：${r.status}`));
 	}
 
 	function tryHijack() {
@@ -136,6 +148,7 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 			width={cfg.width}
 			height={cfg.height}
 			obstacles={cfg.obstacles}
+			sealed={view.rules.sealed ?? []}
 			chars={room.chars}
 			states={view.auth}
 			localCharId={client.charId}
@@ -155,9 +168,22 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 		<div className="stats">
 			<span>权威 tick: <b>{view.tick}</b></span>
 			<span>已确认 seq: <b>{me?.appliedSeq ?? 0}</b></span>
+			<span>规则版本: <b>v{view.rules.version}</b></span>
+			<span>能量: <b>{me?.energy ?? 0}</b></span>
 			<span>待确认: <b className={predicting ? 'warn' : ''}>{view.pending.length}</b></span>
 		</div>
 		<div className="hash mono small">snapshot hash: {view.hash.slice(0, 20) || '…'}</div>
+
+		{view.pending.length > 0 && (
+			<ul className="pending-list">
+				{view.pending.map((p) => (
+					<li key={p.seq} className={p.ruleVersion < view.rules.version ? 'stale-basis' : ''}>
+						seq {p.seq} {p.cmd} → 预测 ({p.predX},{p.predY}) · 依据规则 v{p.ruleVersion}
+						{p.ruleVersion < view.rules.version && `（当前 v${view.rules.version}，待权威判定）`}
+					</li>
+				))}
+			</ul>
+		)}
 
 		<div className="dpad">
 				{CMDS.map((c) => (
@@ -173,8 +199,18 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 		</div>
 		{notice && <div className="notice">{notice}</div>}
 		{view.rejectedInputs.length > 0 && (
-			<div className="notice">
-				最近权威拒绝/阻挡：{view.rejectedInputs.slice(-3).map((p) => `seq ${p.seq} ${p.msg ?? ''}`).join('；')}
+			<div className="notice rejected-list">
+				<div>权威拒绝/阻挡记录（按原顺序保留，不会被修正抹掉）：</div>
+				{view.rejectedInputs.slice(-4).map((p) => (
+					<div key={`${p.seq}-${p.finalX}-${p.finalY}`} className="rejected-item">
+						<span>seq {p.seq} {p.cmd}：{p.msg ?? reasonLabel(p.reason)}</span>
+						{p.needsReconfirm && (
+							<button className="reconfirm" onClick={() => issue(p.cmd)}>
+								按 v{view.rules.version} 重新确认
+							</button>
+						)}
+					</div>
+				))}
 			</div>
 		)}
 	</section>

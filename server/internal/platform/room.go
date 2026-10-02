@@ -28,11 +28,6 @@ type SessionView struct {
 	CharID string `json:"charId"`
 }
 
-type rejectedInput struct {
-	Input  game.Input `json:"input"`
-	Reason string     `json:"reason"`
-}
-
 type queuedJournalEntry struct {
 	Type  string     `json:"type"` // always "queued"
 	Input game.Input `json:"input"`
@@ -42,7 +37,8 @@ type snapshotEvent struct {
 	Type     string              `json:"type"` // "snapshot"
 	Snapshot game.Snapshot       `json:"snapshot"`
 	Applied  []game.AppliedInput `json:"applied"`
-	Rejected []rejectedInput     `json:"rejected,omitempty"`
+	Rejected []game.AppliedInput `json:"rejected,omitempty"`
+	Rules    game.Rules          `json:"rules"`
 }
 
 type tickJournalEntry struct {
@@ -65,25 +61,29 @@ type RoomInstance struct {
 	Views    []CharView
 	Sessions []SessionView
 
-	mu         sync.Mutex
-	eng        *game.Room
-	journal    *store.Journal
-	pending    []game.Input
-	admitted   map[string]int64 // charId -> highest seq seen by intake
-	seen       map[string]map[int64]struct{}
-	waiting    map[string]map[int64]game.Input
-	subs       map[int]chan pubMsg
-	nextSub    int
-	ring       []pubMsg // recent SSE payloads, absolute event ids
-	nextEvtID  int64
-	lastActive time.Time
-	stopped    bool
+	mu           sync.Mutex
+	eng          *game.Room
+	journal      *store.Journal
+	pending      []game.Input
+	pendingRules *game.Rules      // switched at the next tick boundary
+	admitted     map[string]int64 // charId -> highest seq seen by intake
+	seen         map[string]map[int64]struct{}
+	waiting      map[string]map[int64]game.Input
+	subs         map[int]chan pubMsg
+	nextSub      int
+	ring         []pubMsg // recent SSE payloads, absolute event ids
+	nextEvtID    int64
+	lastActive   time.Time
+	stopped      bool
 }
 
 // EnqueueResult is returned for every input POST.
 type EnqueueResult struct {
 	Status     string `json:"status"` // accepted | stale | forbidden
 	AppliedSeq int64  `json:"appliedSeq"`
+	// RuleVersion is the rules version currently in force; clients learn
+	// about rule switches even from a plain input ack.
+	RuleVersion int `json:"ruleVersion"`
 }
 
 func (ri *RoomInstance) enqueue(in game.Input) EnqueueResult {
@@ -93,6 +93,7 @@ func (ri *RoomInstance) enqueue(in game.Input) EnqueueResult {
 }
 
 func (ri *RoomInstance) enqueueLocked(in game.Input, persist bool) EnqueueResult {
+	curVersion := ri.eng.Rules.Version
 	var owner *game.Char
 	for _, ch := range ri.Chars {
 		if ch.ID == in.CharID {
@@ -105,13 +106,13 @@ func (ri *RoomInstance) enqueueLocked(in game.Input, persist bool) EnqueueResult
 		if owner != nil {
 			applied = owner.AppliedSeq
 		}
-		return EnqueueResult{Status: "forbidden", AppliedSeq: applied}
+		return EnqueueResult{Status: "forbidden", AppliedSeq: applied, RuleVersion: curVersion}
 	}
 	if in.Seq <= owner.AppliedSeq {
-		return EnqueueResult{Status: "stale", AppliedSeq: owner.AppliedSeq}
+		return EnqueueResult{Status: "stale", AppliedSeq: owner.AppliedSeq, RuleVersion: curVersion}
 	}
 	if ri.hasBufferedLocked(in.CharID, in.Seq) {
-		return EnqueueResult{Status: "stale", AppliedSeq: owner.AppliedSeq}
+		return EnqueueResult{Status: "stale", AppliedSeq: owner.AppliedSeq, RuleVersion: curVersion}
 	}
 	if persist {
 		if err := ri.journal.Append(queuedJournalEntry{Type: "queued", Input: in}); err != nil {
@@ -120,7 +121,7 @@ func (ri *RoomInstance) enqueueLocked(in game.Input, persist bool) EnqueueResult
 	}
 	ri.admitLocked(in)
 	ri.lastActive = time.Now()
-	return EnqueueResult{Status: "accepted"}
+	return EnqueueResult{Status: "accepted", RuleVersion: curVersion}
 }
 
 func (ri *RoomInstance) hasBufferedLocked(charID string, seq int64) bool {
@@ -196,6 +197,16 @@ func (ri *RoomInstance) nextExpectedLocked(charID string) int64 {
 func (ri *RoomInstance) runTick() {
 	ri.mu.Lock()
 	ri.lastActive = time.Now()
+	if ri.pendingRules != nil {
+		// A rule switch is journaled before the first tick that uses it so
+		// replay re-derives identical accept/reject decisions.
+		rules := *ri.pendingRules
+		ri.pendingRules = nil
+		ri.eng.SetRules(rules)
+		if err := ri.journal.Append(game.RulesRecord{Type: "rules", Tick: ri.eng.Tick + 1, Rules: rules}); err != nil {
+			panic(fmt.Errorf("room %s rules journal append: %w", ri.ID, err))
+		}
+	}
 	batch := ri.pending
 	ri.pending = nil
 	for _, in := range batch {
@@ -206,16 +217,13 @@ func (ri *RoomInstance) runTick() {
 		applied = []game.AppliedInput{}
 	}
 	snap.Hash = snap.HashValue()
-	rejected := make([]rejectedInput, 0)
+	rejected := make([]game.AppliedInput, 0)
 	for _, a := range applied {
 		if !a.Accepted {
-			rejected = append(rejected, rejectedInput{
-				Input:  game.Input{SessionID: a.SessionID, CharID: a.CharID, Seq: a.Seq, Cmd: a.Cmd},
-				Reason: "blocked",
-			})
+			rejected = append(rejected, a)
 		}
 	}
-	ev := snapshotEvent{Type: "snapshot", Snapshot: snap, Applied: applied, Rejected: rejected}
+	ev := snapshotEvent{Type: "snapshot", Snapshot: snap, Applied: applied, Rejected: rejected, Rules: ri.eng.Rules}
 	payload, _ := json.Marshal(ev)
 	jentry := tickJournalEntry{
 		TickRecord: game.TickRecord{Tick: snap.Tick, Inputs: applied},
@@ -283,4 +291,37 @@ func (ri *RoomInstance) snapshot() game.Snapshot {
 	s := ri.eng.Snapshot()
 	s.Hash = s.HashValue()
 	return s
+}
+
+// rules returns the rules currently in force.
+func (ri *RoomInstance) rules() game.Rules {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+	return ri.eng.Rules
+}
+
+// SwitchRules schedules a new rules version (sealed region and/or action
+// costs). It takes effect at the very next tick, is journaled, and forces
+// one tick immediately so the switch is durable and visible even when no
+// inputs are in flight. Returns the new rules.
+func (ri *RoomInstance) SwitchRules(sealed [][2]int, costs map[game.Command]int) game.Rules {
+	ri.mu.Lock()
+	next := ri.eng.Rules
+	next.Version++
+	next.Sealed = sealed
+	if costs != nil {
+		merged := map[game.Command]int{}
+		for k, v := range ri.eng.Rules.Costs {
+			merged[k] = v
+		}
+		for k, v := range costs {
+			merged[k] = v
+		}
+		next.Costs = merged
+	}
+	ri.pendingRules = &next
+	ri.mu.Unlock()
+	// Force a tick so the switch lands in the journal right away.
+	ri.runTick()
+	return next
 }

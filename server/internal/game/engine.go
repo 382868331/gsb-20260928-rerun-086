@@ -32,7 +32,55 @@ type Input struct {
 	CharID    string  `json:"charId"`
 	Seq       int64   `json:"seq"`
 	Cmd       Command `json:"cmd"`
+	// RuleVersion is the rules version the client based this input on when
+	// it was formed (0 = legacy/unversioned). The authority never rewrites
+	// it; it decides explicitly which version to apply.
+	RuleVersion int `json:"ruleVersion,omitempty"`
 }
+
+// Rules is one versioned set of action rules. The authority can switch
+// rules mid-session (e.g. temporarily seal a region or change the energy
+// cost of an action); every switch increments Version and is journaled so
+// replays re-derive identical decisions.
+type Rules struct {
+	Version int             `json:"version"`
+	Sealed  [][2]int        `json:"sealed,omitempty"`
+	Costs   map[Command]int `json:"costs"`
+}
+
+// DefaultRules is version 1: nothing sealed, every move costs 1 energy.
+func DefaultRules() Rules {
+	return Rules{
+		Version: 1,
+		Costs: map[Command]int{
+			CmdUp: 1, CmdDown: 1, CmdLeft: 1, CmdRight: 1, CmdWait: 0,
+		},
+	}
+}
+
+// CostOf returns the energy cost of a command under these rules.
+func (r Rules) CostOf(cmd Command) int {
+	if c, ok := r.Costs[cmd]; ok {
+		return c
+	}
+	if cmd == CmdWait {
+		return 0
+	}
+	return 1
+}
+
+// RulesRecord is the journaled rule-switch event. It takes effect at Tick,
+// before that tick's inputs are executed.
+type RulesRecord struct {
+	Type  string `json:"type"` // always "rules"
+	Tick  int64  `json:"tick"`
+	Rules Rules  `json:"rules"`
+}
+
+const (
+	maxEnergy     = 100
+	energyPerTick = 2
+)
 
 type Char struct {
 	ID           string  `json:"id"`
@@ -42,6 +90,7 @@ type Char struct {
 	X            int     `json:"x"`
 	Y            int     `json:"y"`
 	Facing       Command `json:"facing"`
+	Energy       int     `json:"energy"`
 	// AppliedSeq is the highest input seq the authority has executed for the
 	// owning session. It is also the acknowledgement sent back to clients.
 	AppliedSeq int64 `json:"appliedSeq"`
@@ -58,6 +107,7 @@ type CharState struct {
 	X          int     `json:"x"`
 	Y          int     `json:"y"`
 	Facing     Command `json:"facing"`
+	Energy     int     `json:"energy"`
 	AppliedSeq int64   `json:"appliedSeq"`
 }
 
@@ -79,6 +129,17 @@ type AppliedInput struct {
 	Accepted  bool    `json:"accepted"`
 	X         int     `json:"x"`
 	Y         int     `json:"y"`
+	// RuleVersion is the basis the client declared on the input;
+	// AppliedRuleVersion is the version the authority actually used.
+	RuleVersion        int `json:"ruleVersion,omitempty"`
+	AppliedRuleVersion int `json:"appliedRuleVersion,omitempty"`
+	// Reason explains a rejection: "blocked" | "sealed" | "insufficient-energy".
+	Reason string `json:"reason,omitempty"`
+	// NeedsReconfirm is set when an input formed under older rules was
+	// rejected because the current rules forbid it; the user must
+	// explicitly re-confirm it under the new rules instead of the
+	// authority silently rewriting the original input.
+	NeedsReconfirm bool `json:"needsReconfirm,omitempty"`
 }
 
 // TickRecord is one deterministic append-only event in the room journal.
@@ -89,23 +150,42 @@ type TickRecord struct {
 }
 
 type Room struct {
-	ID    string
-	Cfg   Config
-	Tick  int64
-	Chars []*Char // fixed order, keeps iteration deterministic
-	byID  map[string]*Char
-	walls map[[2]int]struct{}
+	ID     string
+	Cfg    Config
+	Tick   int64
+	Chars  []*Char // fixed order, keeps iteration deterministic
+	Rules  Rules
+	byID   map[string]*Char
+	walls  map[[2]int]struct{}
+	sealed map[[2]int]struct{}
 }
 
 func NewRoom(id string, cfg Config, chars []*Char) *Room {
-	r := &Room{ID: id, Cfg: cfg, Chars: chars, byID: map[string]*Char{}, walls: map[[2]int]struct{}{}}
+	r := &Room{ID: id, Cfg: cfg, Chars: chars, byID: map[string]*Char{}, walls: map[[2]int]struct{}{}, sealed: map[[2]int]struct{}{}}
 	for _, c := range chars {
 		r.byID[c.ID] = c
+		if c.Energy == 0 {
+			c.Energy = maxEnergy
+		}
 	}
 	for _, o := range cfg.Obstacles {
 		r.walls[o] = struct{}{}
 	}
+	r.SetRules(DefaultRules())
 	return r
+}
+
+// SetRules switches the active rules. It is only called at a tick boundary
+// and the switch is journaled as a RulesRecord so replay is deterministic.
+func (r *Room) SetRules(rules Rules) {
+	if rules.Costs == nil {
+		rules.Costs = DefaultRules().Costs
+	}
+	r.Rules = rules
+	r.sealed = map[[2]int]struct{}{}
+	for _, s := range rules.Sealed {
+		r.sealed[s] = struct{}{}
+	}
 }
 
 // DefaultConfig is used by every freshly created room and by replays.
@@ -137,6 +217,13 @@ func (r *Room) ApplyTick(inputs []Input) ([]AppliedInput, Snapshot) {
 		return inputs[i].Seq < inputs[j].Seq
 	})
 	applied := make([]AppliedInput, 0, len(inputs))
+	for _, c := range r.Chars {
+		// Deterministic energy regen, part of the tick so replay matches.
+		c.Energy += energyPerTick
+		if c.Energy > maxEnergy {
+			c.Energy = maxEnergy
+		}
+	}
 	for _, in := range inputs {
 		c := r.byID[in.CharID]
 		if c == nil || c.OwnerSession != in.SessionID {
@@ -152,6 +239,7 @@ func (r *Room) ApplyTick(inputs []Input) ([]AppliedInput, Snapshot) {
 		rec := AppliedInput{
 			Tick: r.Tick, SessionID: in.SessionID, CharID: in.CharID,
 			Seq: in.Seq, Cmd: in.Cmd,
+			RuleVersion: in.RuleVersion, AppliedRuleVersion: r.Rules.Version,
 		}
 		if in.Cmd != CmdWait {
 			c.Facing = in.Cmd
@@ -167,9 +255,24 @@ func (r *Room) ApplyTick(inputs []Input) ([]AppliedInput, Snapshot) {
 		case CmdRight:
 			nx++
 		}
-		if r.passable(nx, ny, c.ID) {
+		cost := r.Rules.CostOf(in.Cmd)
+		switch {
+		case !r.passable(nx, ny, c.ID):
+			rec.Reason = "blocked"
+		case r.isSealed(nx, ny):
+			rec.Reason = "sealed"
+		case c.Energy < cost:
+			rec.Reason = "insufficient-energy"
+		default:
 			c.X, c.Y = nx, ny
+			c.Energy -= cost
 			rec.Accepted = true
+		}
+		if !rec.Accepted && in.RuleVersion > 0 && in.RuleVersion < r.Rules.Version &&
+			(rec.Reason == "sealed" || rec.Reason == "insufficient-energy") {
+			// Formed under older rules and forbidden by the current ones:
+			// the user must re-confirm explicitly under the new rules.
+			rec.NeedsReconfirm = true
 		}
 		rec.X, rec.Y = c.X, c.Y
 		applied = append(applied, rec)
@@ -201,6 +304,12 @@ func (r *Room) passable(x, y int, moverID string) bool {
 	return true
 }
 
+// isSealed reports whether the current rules temporarily close the cell.
+func (r *Room) isSealed(x, y int) bool {
+	_, ok := r.sealed[[2]int{x, y}]
+	return ok
+}
+
 // Passable exposes the movement rule so callers (and the matching client
 // prediction code) can reason about a proposed move.
 func (r *Room) Passable(x, y int, moverID string) bool { return r.passable(x, y, moverID) }
@@ -209,7 +318,7 @@ func (r *Room) Snapshot() Snapshot {
 	s := Snapshot{Tick: r.Tick, Chars: make([]CharState, 0, len(r.Chars))}
 	for _, c := range r.Chars {
 		s.Chars = append(s.Chars, CharState{
-			ID: c.ID, X: c.X, Y: c.Y, Facing: c.Facing, AppliedSeq: c.AppliedSeq,
+			ID: c.ID, X: c.X, Y: c.Y, Facing: c.Facing, Energy: c.Energy, AppliedSeq: c.AppliedSeq,
 		})
 	}
 	return s
@@ -224,46 +333,31 @@ func (s Snapshot) HashValue() string {
 	return hex.EncodeToString(sum[:16])
 }
 
-// Replay rebuilds every snapshot purely from recorded tick records. The room
-// must be constructed from the same initial configuration. Returned snapshots
-// include recomputed hashes; callers compare them against the live journal.
-func Replay(id string, cfg Config, initial []*Char, records []TickRecord) ([]Snapshot, error) {
-	r := NewRoom(id, cfg, cloneChars(initial))
-	out := make([]Snapshot, 0, len(records))
-	for _, rec := range records {
-		if rec.Type != "tick" {
-			continue
-		}
-		if rec.Tick != r.Tick+1 {
-			return nil, fmt.Errorf("non-contiguous tick in journal: want %d got %d", r.Tick+1, rec.Tick)
-		}
-		inputs := make([]Input, 0, len(rec.Inputs))
-		for _, a := range rec.Inputs {
-			inputs = append(inputs, Input{SessionID: a.SessionID, CharID: a.CharID, Seq: a.Seq, Cmd: a.Cmd})
-		}
-		applied, snap := r.ApplyTick(inputs)
-		if len(applied) != len(rec.Inputs) {
-			return nil, fmt.Errorf("tick %d replay diverged on input count", rec.Tick)
-		}
-		for i := range applied {
-			if applied[i] != rec.Inputs[i] {
-				return nil, fmt.Errorf("tick %d replay diverged on input %d", rec.Tick, i)
-			}
-		}
-		snap.Hash = snap.HashValue()
-		out = append(out, snap)
-	}
-	return out, nil
+// JournalEvent is one ordered journal event: either a tick batch or a rule
+// switch. Replay consumes events in journal order so a rule change takes
+// effect at exactly the same tick as it did live.
+type JournalEvent struct {
+	Tick  *TickRecord
+	Rules *RulesRecord
 }
 
-// ReplayRoom applies the journal to a fresh room and returns both the room in
-// its final state and every snapshot hash. It is used to resume a room after
-// restart without re-emitting ticks that were already journaled.
-func ReplayRoom(id string, cfg Config, initial []*Char, records []TickRecord) (*Room, []Snapshot, error) {
+// ReplayJournal rebuilds every snapshot purely from recorded events. The
+// room must be constructed from the same initial configuration. Returned
+// snapshots include recomputed hashes; callers compare them against the
+// live journal.
+func ReplayJournal(id string, cfg Config, initial []*Char, events []JournalEvent) (*Room, []Snapshot, error) {
 	r := NewRoom(id, cfg, cloneChars(initial))
-	out := make([]Snapshot, 0, len(records))
-	for _, rec := range records {
-		if rec.Type != "tick" {
+	out := make([]Snapshot, 0, len(events))
+	for _, ev := range events {
+		if ev.Rules != nil {
+			if ev.Rules.Tick != r.Tick+1 {
+				return nil, nil, fmt.Errorf("rule switch at tick %d, want %d", ev.Rules.Tick, r.Tick+1)
+			}
+			r.SetRules(ev.Rules.Rules)
+			continue
+		}
+		rec := ev.Tick
+		if rec == nil {
 			continue
 		}
 		if rec.Tick != r.Tick+1 {
@@ -271,7 +365,10 @@ func ReplayRoom(id string, cfg Config, initial []*Char, records []TickRecord) (*
 		}
 		inputs := make([]Input, 0, len(rec.Inputs))
 		for _, a := range rec.Inputs {
-			inputs = append(inputs, Input{SessionID: a.SessionID, CharID: a.CharID, Seq: a.Seq, Cmd: a.Cmd})
+			inputs = append(inputs, Input{
+				SessionID: a.SessionID, CharID: a.CharID, Seq: a.Seq, Cmd: a.Cmd,
+				RuleVersion: a.RuleVersion,
+			})
 		}
 		applied, snap := r.ApplyTick(inputs)
 		if len(applied) != len(rec.Inputs) {
@@ -286,6 +383,33 @@ func ReplayRoom(id string, cfg Config, initial []*Char, records []TickRecord) (*
 		out = append(out, snap)
 	}
 	return r, out, nil
+}
+
+// Replay rebuilds snapshots from tick records only (no rule switches).
+func Replay(id string, cfg Config, initial []*Char, records []TickRecord) ([]Snapshot, error) {
+	events := make([]JournalEvent, 0, len(records))
+	for i := range records {
+		if records[i].Type != "tick" {
+			continue
+		}
+		events = append(events, JournalEvent{Tick: &records[i]})
+	}
+	_, snaps, err := ReplayJournal(id, cfg, initial, events)
+	return snaps, err
+}
+
+// ReplayRoom applies the journal to a fresh room and returns both the room
+// in its final state and every snapshot hash. It is used to resume a room
+// after restart without re-emitting ticks that were already journaled.
+func ReplayRoom(id string, cfg Config, initial []*Char, records []TickRecord) (*Room, []Snapshot, error) {
+	events := make([]JournalEvent, 0, len(records))
+	for i := range records {
+		if records[i].Type != "tick" {
+			continue
+		}
+		events = append(events, JournalEvent{Tick: &records[i]})
+	}
+	return ReplayJournal(id, cfg, initial, events)
 }
 
 func cloneChars(in []*Char) []*Char {
