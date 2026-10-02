@@ -25,6 +25,8 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/rooms/{id}", s.getRoom)
 	mux.HandleFunc("GET /api/rooms/{id}/events", s.events)
 	mux.HandleFunc("POST /api/rooms/{id}/inputs", s.postInput)
+	mux.HandleFunc("POST /api/rooms/{id}/confirmations", s.postConfirmation)
+	mux.HandleFunc("POST /api/rooms/{id}/rules", s.postRules)
 	mux.HandleFunc("GET /api/rooms/{id}/journal", s.journal)
 	mux.HandleFunc("POST /api/rooms/{id}/replay", s.replay)
 	return withCommonHeaders(mux)
@@ -88,10 +90,11 @@ func (s *Server) roomOrLoad(id string) (*RoomInstance, error) {
 }
 
 type inputRequest struct {
-	SessionID string       `json:"sessionId"`
-	CharID    string       `json:"charId"`
-	Seq       int64        `json:"seq"`
-	Cmd       game.Command `json:"cmd"`
+	SessionID   string       `json:"sessionId"`
+	CharID      string       `json:"charId"`
+	Seq         int64        `json:"seq"`
+	Cmd         game.Command `json:"cmd"`
+	RuleVersion int          `json:"ruleVersion"`
 }
 
 func (s *Server) postInput(w http.ResponseWriter, r *http.Request) {
@@ -120,7 +123,7 @@ func (s *Server) postInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res := ri.enqueue(game.Input{
-		SessionID: req.SessionID, CharID: req.CharID, Seq: req.Seq, Cmd: req.Cmd,
+		SessionID: req.SessionID, CharID: req.CharID, Seq: req.Seq, Cmd: req.Cmd, RuleVersion: normalizeRuleVersion(req.RuleVersion),
 	})
 	code := 202
 	if res.Status == "forbidden" {
@@ -131,6 +134,67 @@ func (s *Server) postInput(w http.ResponseWriter, r *http.Request) {
 		code = 200
 	}
 	writeJSON(w, code, res)
+}
+
+func normalizeRuleVersion(version int) int {
+	if version <= 0 {
+		return 1
+	}
+	return version
+}
+
+func (s *Server) postConfirmation(w http.ResponseWriter, r *http.Request) {
+	ri, err := s.roomOrLoad(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, 404, "room not found")
+		return
+	}
+	var req inputRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	if req.SessionID == "" || req.CharID == "" || req.Seq <= 0 {
+		writeErr(w, 400, "sessionId, charId and positive seq are required")
+		return
+	}
+	res, _, ok := ri.confirm(game.Input{
+		SessionID: req.SessionID, CharID: req.CharID, Seq: req.Seq, Cmd: req.Cmd,
+		RuleVersion: normalizeRuleVersion(req.RuleVersion),
+	})
+	code := 202
+	if !ok {
+		code = 200
+	}
+	writeJSON(w, code, res)
+}
+
+type ruleRequest struct {
+	Version int `json:"version"`
+}
+
+func (s *Server) postRules(w http.ResponseWriter, r *http.Request) {
+	ri, err := s.roomOrLoad(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, 404, "room not found")
+		return
+	}
+	var req ruleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	rules, ok := game.RulesForVersion(req.Version)
+	if !ok {
+		writeErr(w, 400, "unknown rule version")
+		return
+	}
+	snap, err := ri.switchRules(rules)
+	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]interface{}{"status": "switched", "snapshot": snap})
 }
 
 // events is the SSE stream. Last-Event-ID/?after resume from the in-memory
@@ -246,7 +310,7 @@ func (s *Server) journal(w http.ResponseWriter, r *http.Request) {
 func ReplayFromDisk(dir, id string) (replayResponse, error) {
 	var (
 		initEntry  store.InitEntry
-		records    []game.TickRecord
+		records    []game.JournalRecord
 		liveHashes []string
 	)
 	err := store.ReadEntries(dir, id, func(line []byte) error {
@@ -271,8 +335,14 @@ func ReplayFromDisk(dir, id string) (replayResponse, error) {
 			if err := json.Unmarshal(line, &e); err != nil {
 				return err
 			}
-			records = append(records, e.TickRecord)
+			records = append(records, game.JournalRecord{Type: e.Type, Tick: e.Tick, Inputs: e.Inputs})
 			liveHashes = append(liveHashes, e.Hash)
+		case "rule":
+			var e ruleJournalEntry
+			if err := json.Unmarshal(line, &e); err != nil {
+				return err
+			}
+			records = append(records, game.JournalRecord{Type: e.Type, Tick: e.Tick, Rules: e.Rules})
 		}
 		return nil
 	})
@@ -290,7 +360,7 @@ func ReplayFromDisk(dir, id string) (replayResponse, error) {
 	if err := json.Unmarshal(initEntry.Chars, &chars); err != nil {
 		return replayResponse{}, err
 	}
-	snaps, err := game.Replay(id, cfg, chars, records)
+	snaps, err := game.ReplayJournal(id, cfg, chars, records)
 	if err != nil {
 		return replayResponse{RoomID: id, Errors: []string{err.Error()}}, nil
 	}

@@ -8,6 +8,8 @@ export interface PredConfig {
 	width: number;
 	height: number;
 	obstacles: [number, number][];
+	blocked?: [number, number][];
+	costs?: Partial<Record<Command, number>>;
 }
 
 export function step(
@@ -24,7 +26,8 @@ export function step(
 	else if (cmd === 'left') nx--;
 	else if (cmd === 'right') nx++;
 	if (nx < 0 || ny < 0 || nx >= cfg.width || ny >= cfg.height) return { x, y, moved: false };
-	if (cfg.obstacles.some(([ox, oy]) => ox === nx && oy === ny)) return { x, y, moved: false };
+	const blocked = [...cfg.obstacles, ...(cfg.blocked ?? [])];
+	if (blocked.some(([ox, oy]) => ox === nx && oy === ny)) return { x, y, moved: false };
 	if (others.some((o) => o.x === nx && o.y === ny)) return { x, y, moved: false };
 	return { x: nx, y: ny, moved: true };
 }

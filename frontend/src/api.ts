@@ -56,6 +56,7 @@ export class GameClient {
 	async sendInput(
 		seq: number,
 		cmd: string,
+		ruleVersionOrCallback: number | ((status: number, result: EnqueueResult) => void) = 1,
 		onDuplicate?: (status: number, result: EnqueueResult) => void,
 	): Promise<{ status: number; result: EnqueueResult | null; heldMs: number }> {
 		let resolveCall!: (v: { status: number; result: EnqueueResult | null; heldMs: number }) => void;
@@ -65,7 +66,9 @@ export class GameClient {
 			rejectCall = reject;
 		});
 		const run = this.sendChain.then(async () => {
-			const body = { sessionId: this.sessionId, charId: this.charId, seq, cmd };
+			const ruleVersion = typeof ruleVersionOrCallback === 'number' ? ruleVersionOrCallback : 1;
+			const duplicateHandler = typeof ruleVersionOrCallback === 'function' ? ruleVersionOrCallback : onDuplicate;
+			const body = { sessionId: this.sessionId, charId: this.charId, seq, cmd, ruleVersion };
 			try {
 				const heldMs = await this.weatherBlackout();
 				if (this.chaos.delayMs > 0) await sleep(this.chaos.delayMs);
@@ -74,7 +77,7 @@ export class GameClient {
 				if (this.chaos.duplicateRate > 0 && Math.random() < this.chaos.duplicateRate) {
 					duplicate = sleep(Math.max(120, this.chaos.delayMs + 200)).then(async () => {
 						const d = await postJSON(`/api/rooms/${this.roomId}/inputs`, body);
-						onDuplicate?.(d.status, d.json as EnqueueResult);
+						duplicateHandler?.(d.status, d.json as EnqueueResult);
 					});
 				}
 				const { status, json } = await primary;
@@ -86,6 +89,17 @@ export class GameClient {
 		});
 		this.sendChain = run.catch(() => undefined);
 		return call;
+	}
+
+	async confirmInput(seq: number, cmd: string, ruleVersion: number): Promise<{ status: number; result: EnqueueResult | null }> {
+		const { status, json } = await postJSON(`/api/rooms/${this.roomId}/confirmations`, {
+			sessionId: this.sessionId,
+			charId: this.charId,
+			seq,
+			cmd,
+			ruleVersion,
+		});
+		return { status, result: json as EnqueueResult };
 	}
 
 	private async weatherBlackout(): Promise<number> {
@@ -166,4 +180,13 @@ export async function runReplay(roomId: string): Promise<ReplayResult> {
 	const resp = await fetch(`/api/rooms/${roomId}/replay`, { method: 'POST' });
 	if (!resp.ok) throw new Error(`replay failed: ${resp.status}`);
 	return (await resp.json()) as ReplayResult;
+}
+
+export async function switchRules(roomId: string, version: number): Promise<unknown> {
+	const resp = await fetch(`/api/rooms/${roomId}/rules`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ version }),
+	});
+	return resp.json();
 }

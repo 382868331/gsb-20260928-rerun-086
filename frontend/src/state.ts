@@ -1,7 +1,9 @@
-import type { AppliedInput, CharState, Command, PendingInput, RejectedInput, Snapshot } from './types';
+import type { AppliedInput, CharState, Command, PendingInput, RejectedInput, Rules, Snapshot } from './types';
 import { step, type PredConfig } from './predict';
 
 export interface ClientViewState {
+	ruleVersion: number;
+	rules: Rules;
 	// authoritative state of every character
 	auth: CharState[];
 	tick: number;
@@ -12,12 +14,15 @@ export interface ClientViewState {
 	predX: number;
 	predY: number;
 	predFacing: Command;
+	predEnergy: number;
 	rejectedInputs: RejectedInput[];
 	lastCorrection: { fromX: number; fromY: number; toX: number; toY: number; at: number } | null;
 }
 
 export function initialView(initialAuth: ClientViewState['auth']): ClientViewState {
 	return {
+		ruleVersion: 1,
+		rules: { version: 1, name: 'standard', costs: { up: 1, down: 1, left: 1, right: 1, wait: 0 } },
 		auth: initialAuth,
 		tick: 0,
 		hash: '',
@@ -25,6 +30,7 @@ export function initialView(initialAuth: ClientViewState['auth']): ClientViewSta
 		predX: initialAuth[0]?.x ?? 0,
 		predY: initialAuth[0]?.y ?? 0,
 		predFacing: initialAuth[0]?.facing ?? 'right',
+		predEnergy: initialAuth[0]?.energy ?? 10,
 		rejectedInputs: [],
 		lastCorrection: null,
 	};
@@ -43,13 +49,18 @@ export function applyLocalInput(
 	const baseX = state.pending.length ? state.predX : me.x;
 	const baseY = state.pending.length ? state.predY : me.y;
 	const others = state.auth.filter((c) => c.id !== charId).map((c) => ({ x: c.x, y: c.y }));
-	const next = step(baseX, baseY, cmd, others, cfg);
+	const ruleVersion = state.ruleVersion || 1;
+	const ruleConfig = ruleVersion === 1 ? { ...cfg, blocked: [] } : cfg;
+	const next = step(baseX, baseY, cmd, others, ruleConfig);
 	const facing = cmd === 'wait' ? state.predFacing : cmd;
 	const item: PendingInput = {
 		seq,
 		cmd,
 		sentAt: Date.now(),
 		status: 'predicting',
+		ruleVersion,
+		originalPredX: next.x,
+		originalPredY: next.y,
 		predX: next.x,
 		predY: next.y,
 	};
@@ -59,6 +70,7 @@ export function applyLocalInput(
 		predX: next.x,
 		predY: next.y,
 		predFacing: facing,
+		predEnergy: state.predEnergy - (cfg.costs?.[cmd] ?? 0),
 	};
 }
 
@@ -77,9 +89,10 @@ export function applyAuthority(
 	if (!me || snap.tick < state.tick) return state;
 	// Any pending input at or below the authority's ack is finished (confirmed
 	// or executed-but-blocked). Only still-in-flight seqs are re-predicted.
-	const stillPending = state.pending.filter((p) => p.seq > me.appliedSeq);
 	const mine = applied.filter((a) => a.charId === charId);
 	const settled = new Map(mine.map((a) => [a.seq, a]));
+	const needsConfirmation = new Set(mine.filter((a) => a.decision === 'needs_confirmation').map((a) => a.seq));
+	const stillPending = state.pending.filter((p) => p.seq > me.appliedSeq || needsConfirmation.has(p.seq));
 	const rejectedInputs = [...state.rejectedInputs];
 	let correction = state.lastCorrection;
 	const pendingBySeq = new Map(state.pending.map((p) => [p.seq, p]));
@@ -89,6 +102,15 @@ export function applyAuthority(
 	for (const rec of mine) {
 		const p = pendingBySeq.get(rec.seq);
 		if (!p) continue;
+		if (rec.decision === 'needs_confirmation') {
+			p.status = 'predicting';
+			p.statusDetail = 'needs_confirmation';
+			p.reason = rec.reason;
+			p.ruleVersion = rec.ruleVersion ?? p.ruleVersion;
+			p.predX = p.originalPredX ?? p.predX;
+			p.predY = p.originalPredY ?? p.predY;
+			continue;
+		}
 		const others = chars.filter((c) => c.id !== charId).map((c) => ({ x: c.x, y: c.y }));
 		const projected = step(authorityTailX, authorityTailY, p.cmd, others, cfg);
 		if (!rec.accepted) {
@@ -100,8 +122,8 @@ export function applyAuthority(
 				status: 'rejected',
 				finalX: authorityTailX,
 				finalY: authorityTailY,
-				reason: 'blocked',
-				msg: `预测 (${p.predX},${p.predY})，权威最终 (${authorityTailX},${authorityTailY})`,
+				reason: rec.reason ?? 'blocked',
+				msg: `原规则 v${rec.ruleVersion ?? p.ruleVersion ?? 1} 预测 (${p.originalPredX ?? p.predX},${p.originalPredY ?? p.predY})，当前规则 v${rec.effectiveVersion ?? snap.ruleVersion} 裁定 ${rec.decision ?? 'rejected'}：${rec.reason ?? 'blocked'}；最终 (${authorityTailX},${authorityTailY})`,
 			});
 		} else {
 			authorityTailX = projected.x;
@@ -119,6 +141,7 @@ export function applyAuthority(
 	let py = me.y;
 	let facing = me.facing;
 	for (const p of stillPending) {
+		if (needsConfirmation.has(p.seq)) continue;
 		const others = chars.filter((c) => c.id !== charId).map((c) => ({ x: c.x, y: c.y }));
 		const n = step(px, py, p.cmd, others, cfg);
 		px = n.x;
@@ -126,12 +149,15 @@ export function applyAuthority(
 		if (p.cmd !== 'wait') facing = p.cmd;
 		p.predX = px;
 		p.predY = py;
+		p.statusDetail = undefined;
 	}
 	// Correction is detected from the client's previous rendered layer:
 	// before folding the snapshot, pending inputs predicted state.predX/Y;
 	// after folding, the truth is either the server pos (nothing in flight) or
 	// the re-predicted tail. Any mismatch snaps instead of smoothing.
 	return {
+		ruleVersion: snap.ruleVersion || state.ruleVersion || 1,
+		rules: snap.rules ?? state.rules,
 		auth: chars,
 		tick: snap.tick,
 		hash: snap.hash,
@@ -139,6 +165,7 @@ export function applyAuthority(
 		predX: px,
 		predY: py,
 		predFacing: facing,
+		predEnergy: me.energy ?? state.predEnergy,
 		rejectedInputs,
 		lastCorrection: correction,
 	};
@@ -152,6 +179,8 @@ export function saveView(roomId: string, charId: string, state: ClientViewState,
 	const stored = {
 		nextSeq,
 		view: {
+			ruleVersion: state.ruleVersion,
+			rules: state.rules,
 			auth: state.auth,
 			tick: state.tick,
 			hash: state.hash,
@@ -159,6 +188,7 @@ export function saveView(roomId: string, charId: string, state: ClientViewState,
 			predX: state.predX,
 			predY: state.predY,
 			predFacing: state.predFacing,
+			predEnergy: state.predEnergy,
 			rejectedInputs: state.rejectedInputs.slice(-50),
 		},
 	};
@@ -171,6 +201,9 @@ export function loadView(roomId: string, charId: string): { view: ClientViewStat
 	try {
 		const parsed = JSON.parse(raw) as { nextSeq: number; view: ClientViewState };
 		if (!Array.isArray(parsed.view?.auth) || !Array.isArray(parsed.view?.pending)) return null;
+		parsed.view.ruleVersion ??= 1;
+		parsed.view.rules ??= { version: 1, name: 'standard' };
+		parsed.view.predEnergy ??= parsed.view.auth[0]?.energy ?? 10;
 		parsed.view.rejectedInputs ??= [];
 		parsed.view.lastCorrection = null;
 		return parsed;

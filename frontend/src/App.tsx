@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { createRoom, runReplay, type ChaosConfig, defaultChaos } from './api';
+import { createRoom, runReplay, switchRules, type ChaosConfig, defaultChaos } from './api';
 import { ClientPanel } from './ClientPanel';
 import type { ReplayResult, RoomInfo } from './types';
 
@@ -54,6 +54,12 @@ export default function App() {
 		);
 	}
 
+	async function changeRules(version: number) {
+		if (!room) return;
+		await switchRules(room.roomId, version);
+		pushLog(`服务端已切换权威规则到 v${version}；离线旧输入仍保留原规则依据并逐项裁定`, 'warn');
+	}
+
 	if (error) {
 		return <div className="fatal">{error}<br />请先启动 Go 服务：<code>go run ./cmd/server</code></div>;
 	}
@@ -95,6 +101,8 @@ export default function App() {
 					<b>{chaos.blinkMs || 2500}</b>
 				</div>
 				<div className="control-group replay-group">
+					<button onClick={() => void changeRules(1)}>规则 v1 标准</button>
+					<button onClick={() => void changeRules(2)}>规则 v2 封闭/涨价</button>
 					<button onClick={doReplay}>从保存事件重放校验</button>
 					<label className="inline">
 						<input type="checkbox" checked={autoReplay} onChange={(e) => setAutoReplay(e.target.checked)} />

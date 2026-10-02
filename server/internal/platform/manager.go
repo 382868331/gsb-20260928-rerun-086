@@ -134,7 +134,7 @@ func (m *Manager) Get(id string) (*RoomInstance, error) {
 func (m *Manager) LoadRoom(id string) error {
 	var (
 		initEntry store.InitEntry
-		records   []game.TickRecord
+		records   []game.JournalRecord
 		queued    []game.Input
 	)
 	err := store.ReadEntries(m.dir, id, func(line []byte) error {
@@ -156,7 +156,13 @@ func (m *Manager) LoadRoom(id string) error {
 			if err := json.Unmarshal(line, &e); err != nil {
 				return err
 			}
-			records = append(records, e.TickRecord)
+			records = append(records, game.JournalRecord{Type: e.Type, Tick: e.Tick, Inputs: e.Inputs})
+		case "rule":
+			var e ruleJournalEntry
+			if err := json.Unmarshal(line, &e); err != nil {
+				return err
+			}
+			records = append(records, game.JournalRecord{Type: e.Type, Tick: e.Tick, Rules: e.Rules})
 		case "queued":
 			var e queuedJournalEntry
 			if err := json.Unmarshal(line, &e); err != nil {
@@ -177,7 +183,7 @@ func (m *Manager) LoadRoom(id string) error {
 	if err := json.Unmarshal(initEntry.Chars, &chars); err != nil {
 		return err
 	}
-	restored, _, err := game.ReplayRoom(id, cfg, chars, records)
+	restored, _, err := game.ReplayRoomJournal(id, cfg, chars, records)
 	if err != nil {
 		return err
 	}

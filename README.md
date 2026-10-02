@@ -29,6 +29,12 @@
   `queued`，文件位于 `server/data/<room>.jsonl`。重放接口纯靠日志重建全部快照并与
   实时记录逐 tick 比对 hash；重启后 `LoadRoom` 先重放已确认 tick，再恢复仍未执行的
   `queued` 输入，tick 编号不会回绕。
+- 会话内规则切换：权威规则包含版本、临时封闭格和动作能量消耗；切换事件以 `rule`
+  追加日志。离线输入保留 `ruleVersion` 原始依据，服务端按当前规则逐项返回
+  `accepted`、`rejected` 或 `needs_confirmation`，不会改写客户端原输入。
+- 迟到确认：待确认输入拥有独立水位 `decidedSeq`；重复送达仍是 stale。后继输入不被
+  阻塞，按原 seq 独立处理；用户重开页面后待确认项从 localStorage 恢复，迟到确认走
+  `/confirmations` 并形成新的权威 tick。权威重放会重放规则、拒绝、确认和最终状态。
 
 ## 目录
 
@@ -55,7 +61,12 @@ cd frontend && npm run dev
 - `POST /api/rooms` → `{ roomId, config, chars, sessions }`（sessions 即两个角色的会话凭据）
 - `GET  /api/rooms/{id}/events`：SSE，支持 `Last-Event-ID` / `?after=N`，以及跨重启的 `?afterTick=N`
 - `POST /api/rooms/{id}/inputs`：`{ sessionId, charId, seq, cmd }`，
-  返回 `202 accepted` / `200 stale` / `403 forbidden`
+- `POST /api/rooms/{id}/inputs`：`{ sessionId, charId, seq, cmd, ruleVersion }`，
+  返回 `202 accepted` / `200 stale` / `403 forbidden`；裁定细节在后续 SSE 的
+  `applied[].decision/reason` 与 `rejected[]` 中给出
+- `POST /api/rooms/{id}/rules`：`{ version: 1 | 2 }`，在服务端切换权威规则
+- `POST /api/rooms/{id}/confirmations`：迟到用户确认，body 与原输入一致并带原
+  `ruleVersion`；服务端按当前规则重新裁定并追加确认 tick
 - `POST /api/rooms/{id}/replay`：从落盘事件重放并返回 hash 比对结果
 - `GET  /api/rooms/{id}/journal`：原始 JSONL
 

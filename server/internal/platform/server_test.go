@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"gameplatform/internal/store"
 )
 
 // sseRecorder is an http.ResponseWriter + Flusher used to drive the SSE
@@ -208,4 +210,119 @@ func TestOutOfOrderInputsExecuteInSessionSequence(t *testing.T) {
 	if !rep.Match || rep.Ticks != 1 {
 		t.Fatalf("reordered batch replay = %+v", rep)
 	}
+}
+
+func TestRuleSwitchPreservesBasisAndProcessesLaterInput(t *testing.T) {
+	c, srv := newTestServer(t)
+	info := createRoom(t, c)
+	s := info.Sessions[0]
+
+	rw := c.do("POST", "/api/rooms/"+info.ID+"/rules", strings.NewReader(`{"version":2}`))
+	if rw.Code != 200 {
+		t.Fatalf("switch rules: code=%d body=%s", rw.Code, rw.Body.String())
+	}
+	post := func(seq int64, cmd string, ruleVersion int) (int, EnqueueResult) {
+		return postInput(t, c, info.ID, map[string]interface{}{
+			"sessionId": s.ID, "charId": s.CharID, "seq": seq, "cmd": cmd, "ruleVersion": ruleVersion,
+		})
+	}
+	if code, res := post(1, "up", 1); code != 202 || res.Status != "accepted" {
+		t.Fatalf("old-rule seq1 enqueue: code=%d res=%+v", code, res)
+	}
+	if code, _ := post(2, "wait", 1); code != 202 {
+		t.Fatalf("old-rule seq2 enqueue code=%d", code)
+	}
+	time.Sleep(350 * time.Millisecond)
+	ri, err := srv.mgr.Get(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	me := ri.eng.Chars[0]
+	if me.AppliedSeq != 2 || me.DecidedSeq != 2 || me.X != 2 || me.Y != 2 {
+		t.Fatalf("later input should process after withheld seq1: x=%d y=%d applied=%d decided=%d", me.X, me.Y, me.AppliedSeq, me.DecidedSeq)
+	}
+	if !ri.eng.PendingConfirm(s.CharID, 1) {
+		t.Fatal("seq1 should remain pending explicit user confirmation")
+	}
+	if code, _ := post(1, "up", 1); code != 200 {
+		t.Fatalf("duplicate withheld input code=%d, want stale 200", code)
+	}
+
+	confirmBody := strings.NewReader(`{"sessionId":"` + s.ID + `","charId":"` + s.CharID + `","seq":1,"cmd":"up","ruleVersion":1}`)
+	rw = c.do("POST", "/api/rooms/"+info.ID+"/confirmations", confirmBody)
+	if rw.Code != 202 {
+		t.Fatalf("late confirmation code=%d body=%s", rw.Code, rw.Body.String())
+	}
+	time.Sleep(150 * time.Millisecond)
+	if me.X != 2 || me.Y != 1 {
+		t.Fatalf("late confirmation must have its own independent result: x=%d y=%d", me.X, me.Y)
+	}
+	if ri.eng.PendingConfirm(s.CharID, 1) {
+		t.Fatal("confirmed/rejected seq1 must be removed from pending confirmations")
+	}
+	journal := readJournal(t, srv.mgr.dir, info.ID)
+	if !strings.Contains(journal, "rule-version-changed") || !strings.Contains(journal, "confirmed\":true") {
+		t.Fatalf("journal must retain original basis and independent confirmation rejection:\n%s", journal)
+	}
+	rep, err := ReplayFromDisk(srv.mgr.dir, info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Match || rep.Ticks != 2 {
+		t.Fatalf("rule switch replay = %+v", rep)
+	}
+}
+
+func TestPendingRuleConfirmationSurvivesRestart(t *testing.T) {
+	c, srv := newTestServer(t)
+	info := createRoom(t, c)
+	s := info.Sessions[0]
+	c.do("POST", "/api/rooms/"+info.ID+"/rules", strings.NewReader(`{"version":2}`))
+	postInput(t, c, info.ID, map[string]interface{}{
+		"sessionId": s.ID, "charId": s.CharID, "seq": 1, "cmd": "up", "ruleVersion": 1,
+	})
+	time.Sleep(350 * time.Millisecond)
+
+	mgr2 := NewManager(srv.mgr.dir)
+	if err := mgr2.LoadRoom(info.ID); err != nil {
+		t.Fatal(err)
+	}
+	ri, err := mgr2.Get(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ri.eng.PendingConfirm(s.CharID, 1) {
+		t.Fatal("restored room lost pending rule confirmation")
+	}
+	srv2 := NewServer(srv.mgr.dir)
+	srv2.mgr = mgr2
+	c2 := testClient{h: srv2.Routes()}
+	body := strings.NewReader(`{"sessionId":"` + s.ID + `","charId":"` + s.CharID + `","seq":1,"cmd":"up","ruleVersion":1}`)
+	if rw := c2.do("POST", "/api/rooms/"+info.ID+"/confirmations", body); rw.Code != 202 {
+		t.Fatalf("late confirmation after restart code=%d body=%s", rw.Code, rw.Body.String())
+	}
+	time.Sleep(350 * time.Millisecond)
+	rep, err := ReplayFromDisk(srv.mgr.dir, info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Match || rep.Ticks != 2 {
+		t.Fatalf("restarted confirmation replay = %+v", rep)
+	}
+}
+
+func readJournal(t *testing.T, dir, roomID string) string {
+	t.Helper()
+	var out strings.Builder
+	if err := storeReadEntries(dir, roomID, &out); err != nil {
+		t.Fatal(err)
+	}
+	return out.String()
+}
+
+func storeReadEntries(dir, roomID string, out *strings.Builder) error {
+	return store.ReadEntries(dir, roomID, func(line []byte) error {
+		_, err := out.Write(line)
+		return err
+	})
 }

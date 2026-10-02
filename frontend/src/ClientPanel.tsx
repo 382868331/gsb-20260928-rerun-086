@@ -34,11 +34,19 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 	const [view, setView] = useState<ClientViewState>(() => {
 		const restored = loadView(room.roomId, session.charId);
 		if (restored && restored.view.auth.some((c) => c.id === session.charId)) return restored.view;
-		return initialView(room.chars.map((c) => ({ id: c.id, x: c.x, y: c.y, facing: 'right', appliedSeq: 0 })));
+		return initialView(room.chars.map((c) => ({ id: c.id, x: c.x, y: c.y, facing: 'right', energy: 10, appliedSeq: 0 })));
 	});
 	const [status, setStatus] = useState<TransportStatus>('connecting');
 	const seqRef = useRef(loadView(room.roomId, session.charId)?.nextSeq ?? 0);
 	const [notice, setNotice] = useState<string>('');
+	const currentCfg = useMemo(
+		() => ({
+			...cfg,
+			blocked: view.rules?.blocked ?? [],
+			costs: view.rules?.costs,
+		}),
+		[cfg, view.rules],
+	);
 	useEffect(() => {
 		saveView(room.roomId, client.charId, view, seqRef.current);
 	}, [room.roomId, client.charId, view]);
@@ -53,7 +61,7 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 		if (restored) {
 			client.lastTick = restored.view.tick;
 			restored.view.pending.forEach((p) => {
-				void client.sendInput(p.seq, p.cmd).then(({ status: code, result }) => {
+			void client.sendInput(p.seq, p.cmd, p.ruleVersion ?? 1).then(({ status: code, result }) => {
 					if (code === 403) duplicateSeen(`seq=${p.seq} 恢复重发被会话校验拒绝`);
 					else if (result?.status === 'stale') duplicateSeen(`seq=${p.seq} 恢复重发命中 stale，未重复执行`);
 				});
@@ -61,7 +69,11 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 		}
 		const offEvt = client.onEvent((ev: SnapshotEvent) => {
 			setView((prev) => {
-				return applyAuthority(prev, client.charId, ev.snapshot, ev.applied ?? [], cfg);
+				return applyAuthority(prev, client.charId, ev.snapshot, ev.applied ?? [], {
+					...cfg,
+					blocked: ev.snapshot.rules?.blocked ?? [],
+					costs: ev.snapshot.rules?.costs,
+				});
 			});
 		});
 		const offStatus = client.onStatus(setStatus);
@@ -74,13 +86,14 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 
 	async function issue(cmd: Command) {
 		const seq = ++seqRef.current;
+		const basisVersion = view.ruleVersion || 1;
 		setView((prev) => {
-			const next = applyLocalInput(prev, client.charId, seq, cmd, cfg);
+			const next = applyLocalInput(prev, client.charId, seq, cmd, currentCfg);
 			saveView(room.roomId, client.charId, next, seqRef.current);
 			return next;
 		});
 		try {
-			const { status: code, result } = await client.sendInput(seq, cmd, (_code, dup: EnqueueResult) => {
+			const { status: code, result } = await client.sendInput(seq, cmd, basisVersion, (_code, dup: EnqueueResult) => {
 				duplicateSeen(`重复送达 seq=${seq}：服务端幂等响应 ${dup.status}`);
 			});
 			if (code === 403) {
@@ -90,6 +103,13 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 			}
 		} catch (err) {
 			duplicateSeen(`seq=${seq} 发送失败，已保留本地待确认队列：${String(err)}`);
+		}
+	}
+
+	async function confirmPending(seq: number, cmd: Command, ruleVersion: number) {
+		const { status, result } = await client.confirmInput(seq, cmd, ruleVersion);
+		if (status !== 202 || result?.status !== 'accepted') {
+			duplicateSeen(`seq=${seq} 迟到确认未形成接受：${result?.status ?? 'failed'}`);
 		}
 	}
 
@@ -135,7 +155,7 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 		<Board
 			width={cfg.width}
 			height={cfg.height}
-			obstacles={cfg.obstacles}
+			obstacles={[...cfg.obstacles, ...(view.rules?.blocked ?? [])]}
 			chars={room.chars}
 			states={view.auth}
 			localCharId={client.charId}
@@ -153,6 +173,8 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 		</div>
 
 		<div className="stats">
+			<span>规则: <b>v{view.ruleVersion}</b></span>
+			<span>能量: <b>{me?.energy ?? view.predEnergy}</b></span>
 			<span>权威 tick: <b>{view.tick}</b></span>
 			<span>已确认 seq: <b>{me?.appliedSeq ?? 0}</b></span>
 			<span>待确认: <b className={predicting ? 'warn' : ''}>{view.pending.length}</b></span>
@@ -175,6 +197,18 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 		{view.rejectedInputs.length > 0 && (
 			<div className="notice">
 				最近权威拒绝/阻挡：{view.rejectedInputs.slice(-3).map((p) => `seq ${p.seq} ${p.msg ?? ''}`).join('；')}
+			</div>
+		)}
+		{view.pending.some((p) => p.statusDetail === 'needs_confirmation') && (
+			<div className="notice warn-box">
+				{view.pending
+					.filter((p) => p.statusDetail === 'needs_confirmation')
+					.map((p) => (
+						<div key={p.seq}>
+							seq {p.seq} 原按规则 v{p.ruleVersion} 预测 ({p.originalPredX},{p.originalPredY})，当前规则 v{view.ruleVersion} 要求确认；
+							<button onClick={() => void confirmPending(p.seq, p.cmd, p.ruleVersion ?? 1)}>按当前规则确认</button>
+						</div>
+					))}
 			</div>
 		)}
 	</section>

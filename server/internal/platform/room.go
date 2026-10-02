@@ -29,8 +29,12 @@ type SessionView struct {
 }
 
 type rejectedInput struct {
-	Input  game.Input `json:"input"`
-	Reason string     `json:"reason"`
+	Input            game.Input `json:"input"`
+	Reason           string     `json:"reason"`
+	Decision         string     `json:"decision,omitempty"`
+	EffectiveVersion int        `json:"effectiveVersion,omitempty"`
+	Cost             int        `json:"cost,omitempty"`
+	Energy           int        `json:"energy,omitempty"`
 }
 
 type queuedJournalEntry struct {
@@ -48,6 +52,10 @@ type snapshotEvent struct {
 type tickJournalEntry struct {
 	game.TickRecord
 	Hash string `json:"hash"`
+}
+
+type ruleJournalEntry struct {
+	game.RuleRecord
 }
 
 type pubMsg struct {
@@ -82,8 +90,10 @@ type RoomInstance struct {
 
 // EnqueueResult is returned for every input POST.
 type EnqueueResult struct {
-	Status     string `json:"status"` // accepted | stale | forbidden
-	AppliedSeq int64  `json:"appliedSeq"`
+	Status      string `json:"status"` // accepted | stale | forbidden
+	AppliedSeq  int64  `json:"appliedSeq"`
+	DecidedSeq  int64  `json:"decidedSeq,omitempty"`
+	RuleVersion int    `json:"ruleVersion,omitempty"`
 }
 
 func (ri *RoomInstance) enqueue(in game.Input) EnqueueResult {
@@ -107,8 +117,8 @@ func (ri *RoomInstance) enqueueLocked(in game.Input, persist bool) EnqueueResult
 		}
 		return EnqueueResult{Status: "forbidden", AppliedSeq: applied}
 	}
-	if in.Seq <= owner.AppliedSeq {
-		return EnqueueResult{Status: "stale", AppliedSeq: owner.AppliedSeq}
+	if in.Seq <= owner.DecidedSeq {
+		return EnqueueResult{Status: "stale", AppliedSeq: owner.AppliedSeq, DecidedSeq: owner.DecidedSeq, RuleVersion: ri.eng.CurrentRules().Version}
 	}
 	if ri.hasBufferedLocked(in.CharID, in.Seq) {
 		return EnqueueResult{Status: "stale", AppliedSeq: owner.AppliedSeq}
@@ -120,7 +130,68 @@ func (ri *RoomInstance) enqueueLocked(in game.Input, persist bool) EnqueueResult
 	}
 	ri.admitLocked(in)
 	ri.lastActive = time.Now()
-	return EnqueueResult{Status: "accepted"}
+	return EnqueueResult{Status: "accepted", RuleVersion: ri.eng.CurrentRules().Version}
+}
+
+func (ri *RoomInstance) switchRules(rules game.Rules) (game.Snapshot, error) {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+	rec := ri.eng.ApplyRules(rules)
+	if err := ri.journal.Append(ruleJournalEntry{RuleRecord: rec}); err != nil {
+		return game.Snapshot{}, err
+	}
+	snap := ri.eng.Snapshot()
+	snap.Hash = snap.HashValue()
+	ev := snapshotEvent{Type: "snapshot", Snapshot: snap, Applied: []game.AppliedInput{}}
+	payload, _ := json.Marshal(ev)
+	ri.publishLocked(pubMsg{id: ri.nextEvtID, tick: snap.Tick, payload: payload})
+	ri.nextEvtID++
+	return snap, nil
+}
+
+func (ri *RoomInstance) confirm(in game.Input) (EnqueueResult, snapshotEvent, bool) {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+	in.Confirmed = true
+	applied, snap, ok := ri.eng.ConfirmInput(in)
+	if !ok {
+		var owner *game.Char
+		for _, ch := range ri.eng.Chars {
+			if ch.ID == in.CharID {
+				owner = ch
+			}
+		}
+		appliedSeq, decidedSeq := int64(0), int64(0)
+		if owner != nil {
+			appliedSeq, decidedSeq = owner.AppliedSeq, owner.DecidedSeq
+		}
+		return EnqueueResult{Status: "stale", AppliedSeq: appliedSeq, DecidedSeq: decidedSeq}, snapshotEvent{}, false
+	}
+	snap.Hash = snap.HashValue()
+	appliedList := []game.AppliedInput{applied}
+	ev := snapshotEvent{Type: "snapshot", Snapshot: snap, Applied: appliedList}
+	if !applied.Accepted {
+		ev.Rejected = []rejectedInput{{
+			Input:  game.Input{SessionID: applied.SessionID, CharID: applied.CharID, Seq: applied.Seq, Cmd: applied.Cmd, RuleVersion: applied.RuleVersion, Confirmed: true},
+			Reason: applied.Reason, Decision: applied.Decision, EffectiveVersion: applied.EffectiveVersion, Cost: applied.Cost, Energy: applied.Energy,
+		}}
+	}
+	payload, _ := json.Marshal(ev)
+	jentry := tickJournalEntry{
+		TickRecord: game.TickRecord{Type: "tick", Tick: snap.Tick, Inputs: appliedList}, Hash: snap.Hash,
+	}
+	if err := ri.journal.Append(jentry); err != nil {
+		panic(fmt.Errorf("room %s confirmation journal append: %w", ri.ID, err))
+	}
+	ri.publishLocked(pubMsg{id: ri.nextEvtID, tick: snap.Tick, payload: payload})
+	ri.nextEvtID++
+	var owner *game.Char
+	for _, ch := range ri.eng.Chars {
+		if ch.ID == in.CharID {
+			owner = ch
+		}
+	}
+	return EnqueueResult{Status: "accepted", AppliedSeq: owner.AppliedSeq, DecidedSeq: owner.DecidedSeq, RuleVersion: snap.RuleVersion}, ev, true
 }
 
 func (ri *RoomInstance) hasBufferedLocked(charID string, seq int64) bool {
@@ -184,9 +255,15 @@ func (ri *RoomInstance) nextExpectedLocked(charID string) int64 {
 		}
 	}
 	nextSeq := applied + 1
+	for ri.eng.PendingConfirm(charID, nextSeq) {
+		nextSeq++
+	}
 	for _, in := range ri.pending {
 		if in.CharID == charID && in.Seq == nextSeq {
 			nextSeq++
+			for ri.eng.PendingConfirm(charID, nextSeq) {
+				nextSeq++
+			}
 		}
 	}
 	return nextSeq
@@ -202,6 +279,7 @@ func (ri *RoomInstance) runTick() {
 		ri.markSeenLocked(in.CharID, in.Seq)
 	}
 	applied, snap := ri.eng.ApplyTick(batch)
+	ri.releaseWaitingLocked()
 	if applied == nil {
 		applied = []game.AppliedInput{}
 	}
@@ -210,8 +288,8 @@ func (ri *RoomInstance) runTick() {
 	for _, a := range applied {
 		if !a.Accepted {
 			rejected = append(rejected, rejectedInput{
-				Input:  game.Input{SessionID: a.SessionID, CharID: a.CharID, Seq: a.Seq, Cmd: a.Cmd},
-				Reason: "blocked",
+				Input:  game.Input{SessionID: a.SessionID, CharID: a.CharID, Seq: a.Seq, Cmd: a.Cmd, RuleVersion: a.RuleVersion, Confirmed: a.Confirmed},
+				Reason: a.Reason, Decision: a.Decision, EffectiveVersion: a.EffectiveVersion, Cost: a.Cost, Energy: a.Energy,
 			})
 		}
 	}
@@ -230,6 +308,26 @@ func (ri *RoomInstance) runTick() {
 		// Persistence failure must not be papered over: the room cannot
 		// honestly claim an event log afterwards.
 		panic(fmt.Errorf("room %s journal append: %w", ri.ID, err))
+	}
+}
+
+func (ri *RoomInstance) releaseWaitingLocked() {
+	for {
+		moved := false
+		for charID, wait := range ri.waiting {
+			nextSeq := ri.nextExpectedLocked(charID)
+			in, ok := wait[nextSeq]
+			if !ok {
+				continue
+			}
+			delete(wait, nextSeq)
+			ri.pending = append(ri.pending, in)
+			ri.markSeenLocked(charID, nextSeq)
+			moved = true
+		}
+		if !moved {
+			return
+		}
 	}
 }
 

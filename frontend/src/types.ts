@@ -20,16 +20,27 @@ export interface RoomInfo {
 	sessions: SessionInfo[];
 }
 
+export interface Rules {
+	version: number;
+	name: string;
+	blocked?: [number, number][];
+	costs?: Partial<Record<Command, number>>;
+}
+
 export interface CharState {
 	id: string;
 	x: number;
 	y: number;
 	facing: Command;
+	energy?: number;
 	appliedSeq: number;
+	decidedSeq?: number;
 }
 
 export interface Snapshot {
 	tick: number;
+	ruleVersion?: number;
+	rules?: Rules;
 	chars: CharState[];
 	hash: string;
 }
@@ -41,6 +52,13 @@ export interface AppliedInput {
 	seq: number;
 	cmd: Command;
 	accepted: boolean;
+	decision?: 'accepted' | 'rejected' | 'needs_confirmation';
+	reason?: string;
+	ruleVersion?: number;
+	effectiveVersion?: number;
+	cost?: number;
+	energy?: number;
+	confirmed?: boolean;
 	x: number;
 	y: number;
 }
@@ -49,7 +67,7 @@ export interface SnapshotEvent {
 	type: 'snapshot';
 	snapshot: Snapshot;
 	applied: AppliedInput[];
-	rejected?: { input: { sessionId: string; charId: string; seq: number; cmd: Command }; reason: string }[];
+	rejected?: { input: { sessionId: string; charId: string; seq: number; cmd: Command; ruleVersion?: number; confirmed?: boolean }; reason: string; decision?: string; effectiveVersion?: number; cost?: number; energy?: number }[];
 }
 
 export interface EnqueueResult {
@@ -75,6 +93,11 @@ export interface PendingInput {
 	predX: number;
 	predY: number;
 	msg?: string;
+	statusDetail?: 'needs_confirmation';
+	ruleVersion?: number;
+	originalPredX?: number;
+	originalPredY?: number;
+	reason?: string;
 }
 
 export interface RejectedInput extends PendingInput {
