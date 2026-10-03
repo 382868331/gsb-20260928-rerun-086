@@ -58,12 +58,13 @@ func (s *Server) createRoom(w http.ResponseWriter, r *http.Request) {
 }
 
 type roomInfoResponse struct {
-	RoomID   string        `json:"roomId"`
-	Config   game.Config   `json:"config"`
-	Chars    []CharView    `json:"chars"`
-	Sessions []SessionView `json:"sessions"`
-	Snapshot game.Snapshot `json:"snapshot"`
-	Rules    game.Rules    `json:"rules"`
+	RoomID    string              `json:"roomId"`
+	Config    game.Config         `json:"config"`
+	Chars     []CharView          `json:"chars"`
+	Sessions  []SessionView       `json:"sessions"`
+	Snapshot  game.Snapshot       `json:"snapshot"`
+	Rules     game.Rules          `json:"rules"`
+	Resources []game.ResourceSpec `json:"resources"`
 }
 
 func (s *Server) getRoom(w http.ResponseWriter, r *http.Request) {
@@ -75,12 +76,14 @@ func (s *Server) getRoom(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, roomInfoResponse{
 		RoomID: ri.ID, Config: ri.Cfg, Chars: ri.Views,
 		Sessions: ri.Sessions, Snapshot: ri.snapshot(), Rules: ri.rules(),
+		Resources: ri.Cfg.Resources,
 	})
 }
 
 type rulesRequest struct {
-	Sealed [][2]int             `json:"sealed"`
-	Costs  map[game.Command]int `json:"costs"`
+	Sealed       [][2]int             `json:"sealed"`
+	Costs        map[game.Command]int `json:"costs"`
+	ClaimsClosed *bool                `json:"claimsClosed"`
 }
 
 // postRules switches the room's action rules to a new version (e.g. seal a
@@ -106,7 +109,7 @@ func (s *Server) postRules(w http.ResponseWriter, r *http.Request) {
 	}
 	for cmd, cost := range req.Costs {
 		switch cmd {
-		case game.CmdUp, game.CmdDown, game.CmdLeft, game.CmdRight, game.CmdWait:
+		case game.CmdUp, game.CmdDown, game.CmdLeft, game.CmdRight, game.CmdWait, game.CmdClaim:
 		default:
 			writeErr(w, 400, "unknown command in costs")
 			return
@@ -116,7 +119,7 @@ func (s *Server) postRules(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	rules := ri.SwitchRules(req.Sealed, req.Costs)
+	rules := ri.SwitchRules(req.Sealed, req.Costs, req.ClaimsClosed)
 	writeJSON(w, 200, rules)
 }
 
@@ -136,6 +139,11 @@ type inputRequest struct {
 	CharID    string       `json:"charId"`
 	Seq       int64        `json:"seq"`
 	Cmd       game.Command `json:"cmd"`
+	// Resource is the shared resource a claim targets.
+	Resource string `json:"resource"`
+	// DependsOn marks this input as relying on the success of an earlier
+	// same-session input (0 = independent).
+	DependsOn int64 `json:"dependsOn"`
 	// RuleVersion is the rules version the client based this input on.
 	RuleVersion int `json:"ruleVersion"`
 }
@@ -160,13 +168,31 @@ func (s *Server) postInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch req.Cmd {
-	case game.CmdUp, game.CmdDown, game.CmdLeft, game.CmdRight, game.CmdWait:
+	case game.CmdUp, game.CmdDown, game.CmdLeft, game.CmdRight, game.CmdWait, game.CmdClaim:
 	default:
 		writeErr(w, 400, "unknown command")
 		return
 	}
+	if req.Cmd == game.CmdClaim {
+		found := false
+		for _, spec := range ri.Cfg.Resources {
+			if spec.ID == req.Resource {
+				found = true
+				break
+			}
+		}
+		if !found {
+			writeErr(w, 400, "unknown resource")
+			return
+		}
+	}
+	if req.DependsOn < 0 || req.DependsOn >= req.Seq {
+		writeErr(w, 400, "dependsOn must be >= 0 and < seq")
+		return
+	}
 	res := ri.enqueue(game.Input{
 		SessionID: req.SessionID, CharID: req.CharID, Seq: req.Seq, Cmd: req.Cmd,
+		Resource: req.Resource, DependsOn: req.DependsOn,
 		RuleVersion: req.RuleVersion,
 	})
 	code := 202

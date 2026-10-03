@@ -22,11 +22,12 @@ func NewManager(dataDir string) *Manager {
 }
 
 type CreatedRoom struct {
-	ID       string        `json:"roomId"`
-	Config   game.Config   `json:"config"`
-	Chars    []CharView    `json:"chars"`
-	Sessions []SessionView `json:"sessions"`
-	Rules    game.Rules    `json:"rules"`
+	ID        string              `json:"roomId"`
+	Config    game.Config         `json:"config"`
+	Chars     []CharView          `json:"chars"`
+	Sessions  []SessionView       `json:"sessions"`
+	Rules     game.Rules          `json:"rules"`
+	Resources []game.ResourceSpec `json:"resources"`
 }
 
 var ErrNotFound = errors.New("room not found")
@@ -71,7 +72,7 @@ func (m *Manager) CreateRoom() (*RoomInstance, CreatedRoom, error) {
 	m.rooms[roomID] = ri
 	m.mu.Unlock()
 	go m.tickLoop(ri)
-	return ri, CreatedRoom{ID: roomID, Config: cfg, Chars: views, Sessions: sessions, Rules: ri.eng.Rules}, nil
+	return ri, CreatedRoom{ID: roomID, Config: cfg, Chars: views, Sessions: sessions, Rules: ri.eng.Rules, Resources: cfg.Resources}, nil
 }
 
 func (m *Manager) tickLoop(ri *RoomInstance) {

@@ -22,6 +22,10 @@ const (
 	CmdLeft  Command = "left"
 	CmdRight Command = "right"
 	CmdWait  Command = "wait"
+	// CmdClaim claims one unit of a shared, finite room resource (a pass
+	// slot, a one-time scene item). Several clients may predict the same
+	// claim offline; the authority grants it to exactly one input.
+	CmdClaim Command = "claim"
 )
 
 // Input is a command issued by a session for the character it owns.
@@ -32,10 +36,42 @@ type Input struct {
 	CharID    string  `json:"charId"`
 	Seq       int64   `json:"seq"`
 	Cmd       Command `json:"cmd"`
+	// Resource is the shared resource a claim targets (cmd == claim).
+	Resource string `json:"resource,omitempty"`
+	// DependsOn is the seq of an earlier input from the same session whose
+	// success this input relies on (0 = independent). When the dependency
+	// was rejected, this input is refused with its own independent reason
+	// ("dependency-failed") instead of being silently dropped.
+	DependsOn int64 `json:"dependsOn,omitempty"`
 	// RuleVersion is the rules version the client based this input on when
 	// it was formed (0 = legacy/unversioned). The authority never rewrites
 	// it; it decides explicitly which version to apply.
 	RuleVersion int `json:"ruleVersion,omitempty"`
+}
+
+// ResourceSpec declares one shared finite resource of a room.
+type ResourceSpec struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Total int    `json:"total"`
+}
+
+// Holder records which character's input was granted a resource unit.
+type Holder struct {
+	CharID string `json:"charId"`
+	Seq    int64  `json:"seq"`
+	Tick   int64  `json:"tick"`
+}
+
+// ResourceState is the authoritative state of one shared resource. It is
+// part of every snapshot (and therefore of the snapshot hash) so a grant
+// can never be delivered twice or silently rewritten.
+type ResourceState struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Total     int      `json:"total"`
+	Remaining int      `json:"remaining"`
+	Holders   []Holder `json:"holders"`
 }
 
 // Rules is one versioned set of action rules. The authority can switch
@@ -46,6 +82,9 @@ type Rules struct {
 	Version int             `json:"version"`
 	Sealed  [][2]int        `json:"sealed,omitempty"`
 	Costs   map[Command]int `json:"costs"`
+	// ClaimsClosed temporarily forbids claiming shared resources. Claims
+	// formed under an older version are rejected with needsReconfirm.
+	ClaimsClosed bool `json:"claimsClosed,omitempty"`
 }
 
 // DefaultRules is version 1: nothing sealed, every move costs 1 energy.
@@ -53,7 +92,7 @@ func DefaultRules() Rules {
 	return Rules{
 		Version: 1,
 		Costs: map[Command]int{
-			CmdUp: 1, CmdDown: 1, CmdLeft: 1, CmdRight: 1, CmdWait: 0,
+			CmdUp: 1, CmdDown: 1, CmdLeft: 1, CmdRight: 1, CmdWait: 0, CmdClaim: 0,
 		},
 	}
 }
@@ -100,6 +139,8 @@ type Config struct {
 	Width     int      `json:"width"`
 	Height    int      `json:"height"`
 	Obstacles [][2]int `json:"obstacles"`
+	// Resources are the shared finite resources clients contend for.
+	Resources []ResourceSpec `json:"resources,omitempty"`
 }
 
 type CharState struct {
@@ -112,9 +153,10 @@ type CharState struct {
 }
 
 type Snapshot struct {
-	Tick  int64       `json:"tick"`
-	Chars []CharState `json:"chars"`
-	Hash  string      `json:"hash"`
+	Tick      int64           `json:"tick"`
+	Chars     []CharState     `json:"chars"`
+	Resources []ResourceState `json:"resources,omitempty"`
+	Hash      string          `json:"hash"`
 }
 
 // AppliedInput records that an input was processed at a specific tick.
@@ -126,6 +168,8 @@ type AppliedInput struct {
 	CharID    string  `json:"charId"`
 	Seq       int64   `json:"seq"`
 	Cmd       Command `json:"cmd"`
+	Resource  string  `json:"resource,omitempty"`
+	DependsOn int64   `json:"dependsOn,omitempty"`
 	Accepted  bool    `json:"accepted"`
 	X         int     `json:"x"`
 	Y         int     `json:"y"`
@@ -133,7 +177,9 @@ type AppliedInput struct {
 	// AppliedRuleVersion is the version the authority actually used.
 	RuleVersion        int `json:"ruleVersion,omitempty"`
 	AppliedRuleVersion int `json:"appliedRuleVersion,omitempty"`
-	// Reason explains a rejection: "blocked" | "sealed" | "insufficient-energy".
+	// Reason explains a rejection: "blocked" | "sealed" |
+	// "insufficient-energy" | "resource-exhausted" | "already-claimed" |
+	// "unknown-resource" | "dependency-failed".
 	Reason string `json:"reason,omitempty"`
 	// NeedsReconfirm is set when an input formed under older rules was
 	// rejected because the current rules forbid it; the user must
@@ -155,13 +201,20 @@ type Room struct {
 	Tick   int64
 	Chars  []*Char // fixed order, keeps iteration deterministic
 	Rules  Rules
-	byID   map[string]*Char
-	walls  map[[2]int]struct{}
-	sealed map[[2]int]struct{}
+	byID       map[string]*Char
+	walls      map[[2]int]struct{}
+	sealed     map[[2]int]struct{}
+	resources  map[string]*ResourceState
+	resOrder   []string // config declaration order, keeps snapshots deterministic
+	outcomes   map[string]map[int64]bool // charId -> seq -> accepted, for dependencies
 }
 
 func NewRoom(id string, cfg Config, chars []*Char) *Room {
-	r := &Room{ID: id, Cfg: cfg, Chars: chars, byID: map[string]*Char{}, walls: map[[2]int]struct{}{}, sealed: map[[2]int]struct{}{}}
+	r := &Room{
+		ID: id, Cfg: cfg, Chars: chars,
+		byID: map[string]*Char{}, walls: map[[2]int]struct{}{}, sealed: map[[2]int]struct{}{},
+		resources: map[string]*ResourceState{}, outcomes: map[string]map[int64]bool{},
+	}
 	for _, c := range chars {
 		r.byID[c.ID] = c
 		if c.Energy == 0 {
@@ -170,6 +223,16 @@ func NewRoom(id string, cfg Config, chars []*Char) *Room {
 	}
 	for _, o := range cfg.Obstacles {
 		r.walls[o] = struct{}{}
+	}
+	for _, spec := range cfg.Resources {
+		total := spec.Total
+		if total <= 0 {
+			total = 1
+		}
+		r.resources[spec.ID] = &ResourceState{
+			ID: spec.ID, Name: spec.Name, Total: total, Remaining: total, Holders: []Holder{},
+		}
+		r.resOrder = append(r.resOrder, spec.ID)
 	}
 	r.SetRules(DefaultRules())
 	return r
@@ -194,6 +257,10 @@ func DefaultConfig() Config {
 		Width:     18,
 		Height:    10,
 		Obstacles: [][2]int{{5, 2}, {5, 3}, {5, 4}, {12, 5}, {12, 6}, {12, 7}, {8, 7}, {9, 7}},
+		Resources: []ResourceSpec{
+			{ID: "pass", Name: "通行名额", Total: 1},
+			{ID: "relic", Name: "场景遗物", Total: 1},
+		},
 	}
 }
 
@@ -238,35 +305,45 @@ func (r *Room) ApplyTick(inputs []Input) ([]AppliedInput, Snapshot) {
 		c.AppliedSeq = in.Seq
 		rec := AppliedInput{
 			Tick: r.Tick, SessionID: in.SessionID, CharID: in.CharID,
-			Seq: in.Seq, Cmd: in.Cmd,
+			Seq: in.Seq, Cmd: in.Cmd, Resource: in.Resource, DependsOn: in.DependsOn,
 			RuleVersion: in.RuleVersion, AppliedRuleVersion: r.Rules.Version,
 		}
-		if in.Cmd != CmdWait {
+		if in.Cmd == CmdUp || in.Cmd == CmdDown || in.Cmd == CmdLeft || in.Cmd == CmdRight {
 			c.Facing = in.Cmd
 		}
-		nx, ny := c.X, c.Y
-		switch in.Cmd {
-		case CmdUp:
-			ny--
-		case CmdDown:
-			ny++
-		case CmdLeft:
-			nx--
-		case CmdRight:
-			nx++
-		}
-		cost := r.Rules.CostOf(in.Cmd)
 		switch {
-		case !r.passable(nx, ny, c.ID):
-			rec.Reason = "blocked"
-		case r.isSealed(nx, ny):
-			rec.Reason = "sealed"
-		case c.Energy < cost:
-			rec.Reason = "insufficient-energy"
+		case r.dependencyFailed(in):
+			// The earlier action this input relied on did not succeed (e.g.
+			// another client won the shared resource). Refuse with an
+			// independent reason; unrelated inputs are unaffected.
+			rec.Reason = "dependency-failed"
+		case in.Cmd == CmdClaim:
+			r.applyClaim(c, in, &rec)
 		default:
-			c.X, c.Y = nx, ny
-			c.Energy -= cost
-			rec.Accepted = true
+			nx, ny := c.X, c.Y
+			switch in.Cmd {
+			case CmdUp:
+				ny--
+			case CmdDown:
+				ny++
+			case CmdLeft:
+				nx--
+			case CmdRight:
+				nx++
+			}
+			cost := r.Rules.CostOf(in.Cmd)
+			switch {
+			case !r.passable(nx, ny, c.ID):
+				rec.Reason = "blocked"
+			case r.isSealed(nx, ny):
+				rec.Reason = "sealed"
+			case c.Energy < cost:
+				rec.Reason = "insufficient-energy"
+			default:
+				c.X, c.Y = nx, ny
+				c.Energy -= cost
+				rec.Accepted = true
+			}
 		}
 		if !rec.Accepted && in.RuleVersion > 0 && in.RuleVersion < r.Rules.Version &&
 			(rec.Reason == "sealed" || rec.Reason == "insufficient-energy") {
@@ -276,8 +353,62 @@ func (r *Room) ApplyTick(inputs []Input) ([]AppliedInput, Snapshot) {
 		}
 		rec.X, rec.Y = c.X, c.Y
 		applied = append(applied, rec)
+		r.recordOutcome(in.CharID, in.Seq, rec.Accepted)
 	}
 	return applied, r.Snapshot()
+}
+
+// dependencyFailed reports whether the input declares a dependency on an
+// earlier same-session input whose authoritative outcome was not a success.
+func (r *Room) dependencyFailed(in Input) bool {
+	if in.DependsOn <= 0 {
+		return false
+	}
+	accepted, known := r.outcomes[in.CharID][in.DependsOn]
+	return !known || !accepted
+}
+
+func (r *Room) recordOutcome(charID string, seq int64, accepted bool) {
+	if r.outcomes[charID] == nil {
+		r.outcomes[charID] = map[int64]bool{}
+	}
+	r.outcomes[charID][seq] = accepted
+}
+
+// applyClaim arbitrates one claim on a shared resource. Exactly one input
+// can be granted each unit: the winner is decided by deterministic input
+// order (character declaration order, then seq), never by arrival time.
+func (r *Room) applyClaim(c *Char, in Input, rec *AppliedInput) {
+	cost := r.Rules.CostOf(CmdClaim)
+	rs, ok := r.resources[in.Resource]
+	switch {
+	case r.Rules.ClaimsClosed:
+		rec.Reason = "sealed"
+	case c.Energy < cost:
+		rec.Reason = "insufficient-energy"
+	case !ok:
+		rec.Reason = "unknown-resource"
+	case holdsResource(rs, c.ID):
+		// One grant per character per resource: a re-issued or duplicated
+		// claim can never obtain a second unit.
+		rec.Reason = "already-claimed"
+	case rs.Remaining <= 0:
+		rec.Reason = "resource-exhausted"
+	default:
+		rs.Remaining--
+		rs.Holders = append(rs.Holders, Holder{CharID: c.ID, Seq: in.Seq, Tick: r.Tick})
+		c.Energy -= cost
+		rec.Accepted = true
+	}
+}
+
+func holdsResource(rs *ResourceState, charID string) bool {
+	for _, h := range rs.Holders {
+		if h.CharID == charID {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Room) charIndex(id string) int {
@@ -321,13 +452,21 @@ func (r *Room) Snapshot() Snapshot {
 			ID: c.ID, X: c.X, Y: c.Y, Facing: c.Facing, Energy: c.Energy, AppliedSeq: c.AppliedSeq,
 		})
 	}
+	for _, id := range r.resOrder {
+		rs := r.resources[id]
+		holders := make([]Holder, len(rs.Holders))
+		copy(holders, rs.Holders)
+		s.Resources = append(s.Resources, ResourceState{
+			ID: rs.ID, Name: rs.Name, Total: rs.Total, Remaining: rs.Remaining, Holders: holders,
+		})
+	}
 	return s
 }
 
 // Hash is a canonical content hash of a snapshot, independent of Go map
 // iteration order.
 func (s Snapshot) HashValue() string {
-	clone := Snapshot{Tick: s.Tick, Chars: s.Chars}
+	clone := Snapshot{Tick: s.Tick, Chars: s.Chars, Resources: s.Resources}
 	b, _ := json.Marshal(clone)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:16])
@@ -367,6 +506,7 @@ func ReplayJournal(id string, cfg Config, initial []*Char, events []JournalEvent
 		for _, a := range rec.Inputs {
 			inputs = append(inputs, Input{
 				SessionID: a.SessionID, CharID: a.CharID, Seq: a.Seq, Cmd: a.Cmd,
+				Resource: a.Resource, DependsOn: a.DependsOn,
 				RuleVersion: a.RuleVersion,
 			})
 		}

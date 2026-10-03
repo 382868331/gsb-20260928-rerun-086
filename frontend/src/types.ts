@@ -1,4 +1,25 @@
-export type Command = 'up' | 'down' | 'left' | 'right' | 'wait';
+export type Command = 'up' | 'down' | 'left' | 'right' | 'wait' | 'claim';
+
+// Shared finite resource clients contend for (pass slot, one-time item).
+export interface ResourceSpec {
+	id: string;
+	name: string;
+	total: number;
+}
+
+export interface Holder {
+	charId: string;
+	seq: number;
+	tick: number;
+}
+
+export interface ResourceState {
+	id: string;
+	name: string;
+	total: number;
+	remaining: number;
+	holders: Holder[];
+}
 
 export interface CharMeta {
 	id: string;
@@ -19,6 +40,7 @@ export interface RoomInfo {
 	chars: CharMeta[];
 	sessions: SessionInfo[];
 	rules: Rules;
+	resources: ResourceSpec[];
 }
 
 // Rules is one versioned set of action rules decided by the authority.
@@ -26,6 +48,7 @@ export interface Rules {
 	version: number;
 	sealed?: [number, number][];
 	costs: Partial<Record<Command, number>>;
+	claimsClosed?: boolean;
 }
 
 export interface CharState {
@@ -40,6 +63,7 @@ export interface CharState {
 export interface Snapshot {
 	tick: number;
 	chars: CharState[];
+	resources?: ResourceState[];
 	hash: string;
 }
 
@@ -49,13 +73,22 @@ export interface AppliedInput {
 	charId: string;
 	seq: number;
 	cmd: Command;
+	resource?: string;
+	dependsOn?: number;
 	accepted: boolean;
 	x: number;
 	y: number;
 	// Basis declared by the client vs. version the authority applied.
 	ruleVersion?: number;
 	appliedRuleVersion?: number;
-	reason?: 'blocked' | 'sealed' | 'insufficient-energy';
+	reason?:
+		| 'blocked'
+		| 'sealed'
+		| 'insufficient-energy'
+		| 'resource-exhausted'
+		| 'already-claimed'
+		| 'unknown-resource'
+		| 'dependency-failed';
 	needsReconfirm?: boolean;
 }
 
@@ -86,6 +119,8 @@ export interface ReplayResult {
 export interface PendingInput {
 	seq: number;
 	cmd: Command;
+	resource?: string;
+	dependsOn?: number;
 	sentAt: number;
 	status: 'predicting' | 'confirmed' | 'rejected' | 'duplicate' | 'forbidden' | 'error';
 	predX: number;

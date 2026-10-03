@@ -224,3 +224,89 @@ describe('rule versioning', () => {
 		expect(restored?.view.rejectedInputs[0].needsReconfirm).toBe(true);
 	});
 });
+
+describe('shared resource claims', () => {
+	const pass = (remaining: number, holders: { charId: string; seq: number; tick: number }[] = []) => ({
+		id: 'pass',
+		name: '通行名额',
+		total: 1,
+		remaining,
+		holders,
+	});
+
+	it('predicts a claim optimistically without moving', () => {
+		const s = applyLocalInput(start(), 'c1', 1, 'claim', cfg, { resource: 'pass' });
+		expect(s.pending).toHaveLength(1);
+		expect(s.pending[0].resource).toBe('pass');
+		expect([s.predX, s.predY]).toEqual([1, 1]);
+	});
+
+	it('records a lost arbitration with its reason and keeps it in history', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg, { resource: 'pass' });
+		const snap: Snapshot = {
+			tick: 1,
+			hash: 'h-claim',
+			resources: [pass(0, [{ charId: 'c2', seq: 1, tick: 1 }])],
+			chars: [
+				{ id: 'c1', x: 1, y: 1, facing: 'right', appliedSeq: 1 },
+				{ id: 'c2', x: 4, y: 1, facing: 'left', appliedSeq: 1 },
+			],
+		};
+		const lost: AppliedInput = {
+			tick: 1, sessionId: 's1', charId: 'c1', seq: 1, cmd: 'claim', resource: 'pass',
+			accepted: false, x: 1, y: 1, reason: 'resource-exhausted', ruleVersion: 1, appliedRuleVersion: 1,
+		};
+		s = applyAuthority(s, 'c1', snap, [lost], cfg);
+		expect(s.pending).toHaveLength(0);
+		expect(s.rejectedInputs).toHaveLength(1);
+		expect(s.rejectedInputs[0].reason).toBe('resource-exhausted');
+		expect(s.resources[0].holders[0].charId).toBe('c2');
+		// A later, fully consistent snapshot must not erase the rejection.
+		const snap2: Snapshot = { ...snap, tick: 2, hash: 'h2' };
+		s = applyAuthority(s, 'c1', snap2, [], cfg);
+		expect(s.rejectedInputs).toHaveLength(1);
+	});
+
+	it('gives a dependent action its own independent rejection reason', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg, { resource: 'pass' });
+		s = applyLocalInput(s, 'c1', 2, 'right', cfg, { dependsOn: 1 });
+		expect(s.pending[1].dependsOn).toBe(1);
+		const snap: Snapshot = {
+			tick: 1,
+			hash: 'h-dep',
+			resources: [pass(0, [{ charId: 'c2', seq: 1, tick: 1 }])],
+			chars: [
+				{ id: 'c1', x: 1, y: 1, facing: 'right', appliedSeq: 2 },
+				{ id: 'c2', x: 4, y: 1, facing: 'left', appliedSeq: 1 },
+			],
+		};
+		const applied: AppliedInput[] = [
+			{ tick: 1, sessionId: 's1', charId: 'c1', seq: 1, cmd: 'claim', resource: 'pass', accepted: false, x: 1, y: 1, reason: 'resource-exhausted' },
+			{ tick: 1, sessionId: 's1', charId: 'c1', seq: 2, cmd: 'right', dependsOn: 1, accepted: false, x: 1, y: 1, reason: 'dependency-failed' },
+		];
+		s = applyAuthority(s, 'c1', snap, applied, cfg);
+		expect(s.rejectedInputs).toHaveLength(2);
+		expect(s.rejectedInputs[1].reason).toBe('dependency-failed');
+		expect(s.rejectedInputs[1].msg).toContain('seq 1');
+	});
+
+	it('marks a granted claim by folding authoritative resources', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg, { resource: 'pass' });
+		const snap: Snapshot = {
+			tick: 1,
+			hash: 'h-win',
+			resources: [pass(0, [{ charId: 'c1', seq: 1, tick: 1 }])],
+			chars: [
+				{ id: 'c1', x: 1, y: 1, facing: 'right', appliedSeq: 1 },
+				{ id: 'c2', x: 4, y: 1, facing: 'left', appliedSeq: 0 },
+			],
+		};
+		const won: AppliedInput = {
+			tick: 1, sessionId: 's1', charId: 'c1', seq: 1, cmd: 'claim', resource: 'pass', accepted: true, x: 1, y: 1,
+		};
+		s = applyAuthority(s, 'c1', snap, [won], cfg);
+		expect(s.rejectedInputs).toHaveLength(0);
+		expect(s.resources[0].remaining).toBe(0);
+		expect(s.resources[0].holders[0].charId).toBe('c1');
+	});
+});

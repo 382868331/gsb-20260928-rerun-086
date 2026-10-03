@@ -159,3 +159,23 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 	background: transparent; color: var(--warn); cursor: pointer; white-space: nowrap;
 }
 .reconfirm:hover { background: rgba(251, 191, 36, .12); }
+
+.resources {
+	margin: 6px 0;
+	padding: 6px 8px;
+	border: 1px solid #334155;
+	border-radius: 6px;
+	font-size: 12px;
+}
+.resource-line {
+	line-height: 1.7;
+}
+.resource-line .warn {
+	color: #fbbf24;
+}
+.inline {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	font-size: 12px;
+}

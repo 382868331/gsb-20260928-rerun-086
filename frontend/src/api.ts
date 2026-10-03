@@ -58,6 +58,7 @@ export class GameClient {
 		cmd: string,
 		ruleVersion: number,
 		onDuplicate?: (status: number, result: EnqueueResult) => void,
+		extra?: { resource?: string; dependsOn?: number },
 	): Promise<{ status: number; result: EnqueueResult | null; heldMs: number }> {
 		let resolveCall!: (v: { status: number; result: EnqueueResult | null; heldMs: number }) => void;
 		let rejectCall!: (err: unknown) => void;
@@ -66,7 +67,15 @@ export class GameClient {
 			rejectCall = reject;
 		});
 		const run = this.sendChain.then(async () => {
-			const body = { sessionId: this.sessionId, charId: this.charId, seq, cmd, ruleVersion };
+			const body = {
+				sessionId: this.sessionId,
+				charId: this.charId,
+				seq,
+				cmd,
+				ruleVersion,
+				resource: extra?.resource,
+				dependsOn: extra?.dependsOn ?? 0,
+			};
 			try {
 				const heldMs = await this.weatherBlackout();
 				if (this.chaos.delayMs > 0) await sleep(this.chaos.delayMs);
@@ -175,11 +184,12 @@ export async function changeRules(
 	roomId: string,
 	sealed: [number, number][],
 	costs: Partial<Record<Command, number>>,
+	claimsClosed?: boolean,
 ): Promise<Rules> {
 	const resp = await fetch(`/api/rooms/${roomId}/rules`, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ sealed, costs }),
+		body: JSON.stringify({ sealed, costs, claimsClosed }),
 	});
 	if (!resp.ok) throw new Error(`rules switch failed: ${resp.status}`);
 	return (await resp.json()) as Rules;

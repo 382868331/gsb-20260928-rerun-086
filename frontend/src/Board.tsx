@@ -21,6 +21,7 @@ const arrow: Record<Command, string> = {
 	left: '◀',
 	right: '▶',
 	wait: '•',
+	claim: '◆',
 };
 
 export function Board(props: BoardProps) {

@@ -1,4 +1,4 @@
-import type { AppliedInput, CharState, Command, PendingInput, RejectedInput, Rules, Snapshot } from './types';
+import type { AppliedInput, CharState, Command, PendingInput, RejectedInput, ResourceState, Rules, Snapshot } from './types';
 import { step, type PredConfig } from './predict';
 
 export interface ClientViewState {
@@ -8,6 +8,8 @@ export interface ClientViewState {
 	hash: string;
 	// rules version the authority currently applies (learned from events)
 	rules: Rules;
+	// authoritative shared-resource state (grants, remaining units)
+	resources: ResourceState[];
 	// local pending inputs (predicted, not yet confirmed)
 	pending: PendingInput[];
 	// predicted position of the locally owned character (last unacked layer)
@@ -18,12 +20,17 @@ export interface ClientViewState {
 	lastCorrection: { fromX: number; fromY: number; toX: number; toY: number; at: number } | null;
 }
 
-export function initialView(initialAuth: ClientViewState['auth'], rules?: Rules): ClientViewState {
+export function initialView(
+	initialAuth: ClientViewState['auth'],
+	rules?: Rules,
+	resources?: ResourceState[],
+): ClientViewState {
 	return {
 		auth: initialAuth,
 		tick: 0,
 		hash: '',
 		rules: rules ?? { version: 1, costs: {} },
+		resources: resources ?? [],
 		pending: [],
 		predX: initialAuth[0]?.x ?? 0,
 		predY: initialAuth[0]?.y ?? 0,
@@ -33,13 +40,16 @@ export function initialView(initialAuth: ClientViewState['auth'], rules?: Rules)
 	};
 }
 
-// applyLocalInput layers one new predicted move on top of authority + pending.
+// applyLocalInput layers one new predicted action on top of authority +
+// pending. A claim predicts optimistically that the resource will be
+// granted; the authoritative snapshot decides who actually holds it.
 export function applyLocalInput(
 	state: ClientViewState,
 	charId: string,
 	seq: number,
 	cmd: Command,
 	cfg: PredConfig,
+	extra?: { resource?: string; dependsOn?: number },
 ): ClientViewState {
 	const me = state.auth.find((c) => c.id === charId);
 	if (!me) return state;
@@ -47,11 +57,14 @@ export function applyLocalInput(
 	const baseX = state.pending.length ? state.predX : me.x;
 	const baseY = state.pending.length ? state.predY : me.y;
 	const others = state.auth.filter((c) => c.id !== charId).map((c) => ({ x: c.x, y: c.y }));
-	const next = step(baseX, baseY, cmd, others, effCfg);
-	const facing = cmd === 'wait' ? state.predFacing : cmd;
+	const isMove = cmd === 'up' || cmd === 'down' || cmd === 'left' || cmd === 'right';
+	const next = isMove ? step(baseX, baseY, cmd, others, effCfg) : { x: baseX, y: baseY };
+	const facing = isMove ? cmd : state.predFacing;
 	const item: PendingInput = {
 		seq,
 		cmd,
+		resource: extra?.resource,
+		dependsOn: extra?.dependsOn,
 		sentAt: Date.now(),
 		status: 'predicting',
 		predX: next.x,
@@ -82,6 +95,7 @@ export function applyAuthority(
 	const me = chars.find((c) => c.id === charId);
 	if (!me || snap.tick < state.tick) return state;
 	const nextRules = rules ?? state.rules;
+	const nextResources = snap.resources ?? state.resources;
 	const effCfg = { ...cfg, sealed: nextRules.sealed };
 	// Any pending input at or below the authority's ack is finished (confirmed
 	// or executed-but-blocked). Only still-in-flight seqs are re-predicted.
@@ -104,6 +118,8 @@ export function applyAuthority(
 				correction = { fromX: p.predX, fromY: p.predY, toX: authorityTailX, toY: authorityTailY, at: Date.now() };
 			}
 			const reason = rec.reason ?? 'blocked';
+			const target = p.cmd === 'claim' ? `「${p.resource ?? ''}」` : '';
+			const dep = rec.reason === 'dependency-failed' && p.dependsOn ? `（依赖 seq ${p.dependsOn} 未成功）` : '';
 			rejectedInputs.push({
 				...p,
 				status: 'rejected',
@@ -112,7 +128,7 @@ export function applyAuthority(
 				reason,
 				appliedRuleVersion: rec.appliedRuleVersion,
 				needsReconfirm: rec.needsReconfirm,
-				msg: `依据 v${p.ruleVersion} 预测 (${p.predX},${p.predY})，权威按 v${rec.appliedRuleVersion ?? p.ruleVersion} 判定${reasonLabel(reason)}，最终 (${authorityTailX},${authorityTailY})`,
+				msg: `依据 v${p.ruleVersion} 预测${target ? `取得${target}` : ` (${p.predX},${p.predY})`}，权威按 v${rec.appliedRuleVersion ?? p.ruleVersion} 判定${reasonLabel(reason)}${dep}`,
 			});
 		} else {
 			authorityTailX = projected.x;
@@ -149,6 +165,7 @@ export function applyAuthority(
 		tick: snap.tick,
 		hash: snap.hash,
 		rules: nextRules,
+		resources: nextResources,
 		pending: stillPending,
 		predX: px,
 		predY: py,
@@ -161,9 +178,17 @@ export function applyAuthority(
 export function reasonLabel(reason: string): string {
 	switch (reason) {
 		case 'sealed':
-			return '拒绝（区域已封闭）';
+			return '拒绝（区域/领取已封闭）';
 		case 'insufficient-energy':
 			return '拒绝（能量不足）';
+		case 'resource-exhausted':
+			return '拒绝（资源已被其他客户端取得）';
+		case 'already-claimed':
+			return '拒绝（已领取过，不可重复）';
+		case 'unknown-resource':
+			return '拒绝（未知资源）';
+		case 'dependency-failed':
+			return '拒绝（依赖的前置动作未成功）';
 		default:
 			return '阻挡';
 	}
@@ -181,6 +206,7 @@ export function saveView(roomId: string, charId: string, state: ClientViewState,
 			tick: state.tick,
 			hash: state.hash,
 			rules: state.rules,
+			resources: state.resources,
 			pending: state.pending,
 			predX: state.predX,
 			predY: state.predY,
@@ -199,6 +225,7 @@ export function loadView(roomId: string, charId: string): { view: ClientViewStat
 		if (!Array.isArray(parsed.view?.auth) || !Array.isArray(parsed.view?.pending)) return null;
 		parsed.view.rejectedInputs ??= [];
 		parsed.view.rules ??= { version: 1, costs: {} };
+		parsed.view.resources ??= [];
 		parsed.view.lastCorrection = null;
 		return parsed;
 	} catch {
