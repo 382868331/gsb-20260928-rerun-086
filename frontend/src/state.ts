@@ -1,4 +1,4 @@
-import type { AppliedInput, CharState, Command, PendingInput, RejectedInput, Rules, Snapshot } from './types';
+import type { AppliedInput, CharState, ClaimVerdict, Command, PendingInput, RejectedInput, Rules, Snapshot } from './types';
 import { step, type PredConfig } from './predict';
 
 export interface ClientViewState {
@@ -8,6 +8,10 @@ export interface ClientViewState {
 	hash: string;
 	// rules version the authority currently applies (learned from events)
 	rules: Rules;
+	// remaining shared-resource pool, from the authoritative snapshot
+	passesLeft: number;
+	// recent shared-resource adjudications for BOTH clients (authority order)
+	claims: ClaimVerdict[];
 	// local pending inputs (predicted, not yet confirmed)
 	pending: PendingInput[];
 	// predicted position of the locally owned character (last unacked layer)
@@ -18,12 +22,14 @@ export interface ClientViewState {
 	lastCorrection: { fromX: number; fromY: number; toX: number; toY: number; at: number } | null;
 }
 
-export function initialView(initialAuth: ClientViewState['auth'], rules?: Rules): ClientViewState {
+export function initialView(initialAuth: ClientViewState['auth'], rules?: Rules, passesLeft = 0): ClientViewState {
 	return {
 		auth: initialAuth,
 		tick: 0,
 		hash: '',
 		rules: rules ?? { version: 1, costs: {} },
+		passesLeft,
+		claims: [],
 		pending: [],
 		predX: initialAuth[0]?.x ?? 0,
 		predY: initialAuth[0]?.y ?? 0,
@@ -40,6 +46,7 @@ export function applyLocalInput(
 	seq: number,
 	cmd: Command,
 	cfg: PredConfig,
+	dependsOn = 0,
 ): ClientViewState {
 	const me = state.auth.find((c) => c.id === charId);
 	if (!me) return state;
@@ -48,7 +55,7 @@ export function applyLocalInput(
 	const baseY = state.pending.length ? state.predY : me.y;
 	const others = state.auth.filter((c) => c.id !== charId).map((c) => ({ x: c.x, y: c.y }));
 	const next = step(baseX, baseY, cmd, others, effCfg);
-	const facing = cmd === 'wait' ? state.predFacing : cmd;
+	const facing = cmd === 'wait' || cmd === 'claim' ? state.predFacing : cmd;
 	const item: PendingInput = {
 		seq,
 		cmd,
@@ -57,6 +64,7 @@ export function applyLocalInput(
 		predX: next.x,
 		predY: next.y,
 		ruleVersion: state.rules.version,
+		dependsOn: dependsOn > 0 ? dependsOn : undefined,
 	};
 	return {
 		...state,
@@ -89,6 +97,24 @@ export function applyAuthority(
 	const mine = applied.filter((a) => a.charId === charId);
 	const settled = new Map(mine.map((a) => [a.seq, a]));
 	const rejectedInputs = [...state.rejectedInputs];
+	// Shared-resource adjudications from this tick, for BOTH clients: the
+	// same authoritative verdict list is folded into every client's view,
+	// so no client's last-arriving prediction becomes the common result.
+	const claims = [...state.claims];
+	for (const a of applied) {
+		if (a.cmd !== 'claim') continue;
+		if (claims.some((v) => v.charId === a.charId && v.seq === a.seq)) continue;
+		claims.push({
+			tick: a.tick,
+			charId: a.charId,
+			seq: a.seq,
+			granted: a.accepted,
+			reason: a.accepted ? undefined : (a.reason ?? 'resource-exhausted'),
+			ruleVersion: a.ruleVersion,
+			appliedRuleVersion: a.appliedRuleVersion,
+		});
+	}
+	while (claims.length > 20) claims.shift();
 	let correction = state.lastCorrection;
 	const pendingBySeq = new Map(state.pending.map((p) => [p.seq, p]));
 	const previousMe = state.auth.find((c) => c.id === charId);
@@ -104,6 +130,9 @@ export function applyAuthority(
 				correction = { fromX: p.predX, fromY: p.predY, toX: authorityTailX, toY: authorityTailY, at: Date.now() };
 			}
 			const reason = rec.reason ?? 'blocked';
+			const msg = p.cmd === 'claim'
+				? `依据 v${p.ruleVersion} 预测取得名额，权威按 v${rec.appliedRuleVersion ?? p.ruleVersion} 判定${reasonLabel(reason)}`
+				: `依据 v${p.ruleVersion} 预测 (${p.predX},${p.predY})，权威按 v${rec.appliedRuleVersion ?? p.ruleVersion} 判定${reasonLabel(reason)}，最终 (${authorityTailX},${authorityTailY})`;
 			rejectedInputs.push({
 				...p,
 				status: 'rejected',
@@ -112,7 +141,7 @@ export function applyAuthority(
 				reason,
 				appliedRuleVersion: rec.appliedRuleVersion,
 				needsReconfirm: rec.needsReconfirm,
-				msg: `依据 v${p.ruleVersion} 预测 (${p.predX},${p.predY})，权威按 v${rec.appliedRuleVersion ?? p.ruleVersion} 判定${reasonLabel(reason)}，最终 (${authorityTailX},${authorityTailY})`,
+				msg,
 			});
 		} else {
 			authorityTailX = projected.x;
@@ -134,7 +163,7 @@ export function applyAuthority(
 		const n = step(px, py, p.cmd, others, effCfg);
 		px = n.x;
 		py = n.y;
-		if (p.cmd !== 'wait') facing = p.cmd;
+		if (p.cmd !== 'wait' && p.cmd !== 'claim') facing = p.cmd;
 		// Re-predicted for rendering only: p.ruleVersion keeps the original
 		// rule basis so the correction never erases it.
 		p.predX = px;
@@ -149,6 +178,8 @@ export function applyAuthority(
 		tick: snap.tick,
 		hash: snap.hash,
 		rules: nextRules,
+		passesLeft: snap.passesLeft ?? state.passesLeft,
+		claims,
 		pending: stillPending,
 		predX: px,
 		predY: py,
@@ -164,6 +195,12 @@ export function reasonLabel(reason: string): string {
 			return '拒绝（区域已封闭）';
 		case 'insufficient-energy':
 			return '拒绝（能量不足）';
+		case 'resource-exhausted':
+			return '拒绝（名额已被其他客户端取得）';
+		case 'dependency-rejected':
+			return '拒绝（所依赖的动作未成功）';
+		case 'claims-closed':
+			return '拒绝（当前规则禁止领取名额）';
 		default:
 			return '阻挡';
 	}
@@ -181,6 +218,8 @@ export function saveView(roomId: string, charId: string, state: ClientViewState,
 			tick: state.tick,
 			hash: state.hash,
 			rules: state.rules,
+			passesLeft: state.passesLeft,
+			claims: state.claims.slice(-20),
 			pending: state.pending,
 			predX: state.predX,
 			predY: state.predY,
@@ -199,6 +238,8 @@ export function loadView(roomId: string, charId: string): { view: ClientViewStat
 		if (!Array.isArray(parsed.view?.auth) || !Array.isArray(parsed.view?.pending)) return null;
 		parsed.view.rejectedInputs ??= [];
 		parsed.view.rules ??= { version: 1, costs: {} };
+		parsed.view.passesLeft ??= 0;
+		parsed.view.claims ??= [];
 		parsed.view.lastCorrection = null;
 		return parsed;
 	} catch {

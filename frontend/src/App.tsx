@@ -7,8 +7,8 @@ import type { Command, ReplayResult, RoomInfo } from './types';
 const SEAL_REGION: [number, number][] = [
 	[6, 3], [6, 4], [6, 5], [6, 6], [7, 4], [7, 5],
 ];
-const NORMAL_COSTS: Record<Command, number> = { up: 1, down: 1, left: 1, right: 1, wait: 0 };
-const COSTLY_COSTS: Record<Command, number> = { up: 5, down: 5, left: 5, right: 5, wait: 0 };
+const NORMAL_COSTS: Record<Command, number> = { up: 1, down: 1, left: 1, right: 1, wait: 0, claim: 0 };
+const COSTLY_COSTS: Record<Command, number> = { up: 5, down: 5, left: 5, right: 5, wait: 0, claim: 50 };
 
 interface LogLine {
 	id: number;
@@ -61,12 +61,12 @@ export default function App() {
 		);
 	}
 
-	async function switchRules(sealed: [number, number][], costs: Record<Command, number>, label: string) {
+	async function switchRules(sealed: [number, number][], costs: Record<Command, number>, claimsClosed: boolean, label: string) {
 		if (!room) return;
 		try {
-			const rules = await changeRules(room.roomId, sealed, costs);
+			const rules = await changeRules(room.roomId, sealed, costs, claimsClosed);
 			pushLog(
-				`规则切换为 v${rules.version}（${label}）：封闭 ${rules.sealed?.length ?? 0} 格，移动消耗 ${rules.costs.right ?? 1}；旧依据输入将由服务端逐项判定`,
+				`规则切换为 v${rules.version}（${label}）：封闭 ${rules.sealed?.length ?? 0} 格，移动消耗 ${rules.costs.right ?? 1}，名额领取${rules.claimsClosed ? '关闭' : '开放'}；旧依据输入将由服务端逐项判定`,
 				'warn',
 			);
 		} catch (e) {
@@ -122,9 +122,10 @@ export default function App() {
 					</label>
 				</div>
 				<div className="control-group replay-group">
-					<button onClick={() => switchRules(SEAL_REGION, NORMAL_COSTS, '暂时封闭中部区域')}>封闭一段区域</button>
-					<button onClick={() => switchRules([], COSTLY_COSTS, '移动消耗 ×5')}>提高移动消耗</button>
-					<button onClick={() => switchRules([], NORMAL_COSTS, '恢复默认规则')}>恢复默认规则</button>
+					<button onClick={() => switchRules(SEAL_REGION, NORMAL_COSTS, false, '暂时封闭中部区域')}>封闭一段区域</button>
+					<button onClick={() => switchRules([], COSTLY_COSTS, false, '移动/领取消耗 ×5')}>提高动作消耗</button>
+					<button onClick={() => switchRules([], NORMAL_COSTS, true, '关闭名额领取')}>关闭名额领取</button>
+					<button onClick={() => switchRules([], NORMAL_COSTS, false, '恢复默认规则')}>恢复默认规则</button>
 				</div>
 			</section>
 

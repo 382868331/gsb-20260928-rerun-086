@@ -22,6 +22,9 @@ const (
 	CmdLeft  Command = "left"
 	CmdRight Command = "right"
 	CmdWait  Command = "wait"
+	// CmdClaim attempts to take one slot of the room's finite shared
+	// resource (a pass that only a limited number of characters can hold).
+	CmdClaim Command = "claim"
 )
 
 // Input is a command issued by a session for the character it owns.
@@ -36,6 +39,11 @@ type Input struct {
 	// it was formed (0 = legacy/unversioned). The authority never rewrites
 	// it; it decides explicitly which version to apply.
 	RuleVersion int `json:"ruleVersion,omitempty"`
+	// DependsOn is the seq of an earlier input of the SAME session whose
+	// success this input relies on (0 = independent). If that input was
+	// rejected, this one is rejected too — with its own explicit reason —
+	// while independent inputs keep processing normally.
+	DependsOn int64 `json:"dependsOn,omitempty"`
 }
 
 // Rules is one versioned set of action rules. The authority can switch
@@ -46,6 +54,10 @@ type Rules struct {
 	Version int             `json:"version"`
 	Sealed  [][2]int        `json:"sealed,omitempty"`
 	Costs   map[Command]int `json:"costs"`
+	// ClaimsClosed forbids shared-resource claims under this version.
+	// Inputs formed under an older version are not silently rewritten:
+	// they are rejected with an explicit re-confirm request.
+	ClaimsClosed bool `json:"claimsClosed,omitempty"`
 }
 
 // DefaultRules is version 1: nothing sealed, every move costs 1 energy.
@@ -53,7 +65,7 @@ func DefaultRules() Rules {
 	return Rules{
 		Version: 1,
 		Costs: map[Command]int{
-			CmdUp: 1, CmdDown: 1, CmdLeft: 1, CmdRight: 1, CmdWait: 0,
+			CmdUp: 1, CmdDown: 1, CmdLeft: 1, CmdRight: 1, CmdWait: 0, CmdClaim: 0,
 		},
 	}
 }
@@ -91,6 +103,8 @@ type Char struct {
 	Y            int     `json:"y"`
 	Facing       Command `json:"facing"`
 	Energy       int     `json:"energy"`
+	// Passes is the number of shared-resource slots this character holds.
+	Passes int `json:"passes"`
 	// AppliedSeq is the highest input seq the authority has executed for the
 	// owning session. It is also the acknowledgement sent back to clients.
 	AppliedSeq int64 `json:"appliedSeq"`
@@ -100,6 +114,9 @@ type Config struct {
 	Width     int      `json:"width"`
 	Height    int      `json:"height"`
 	Obstacles [][2]int `json:"obstacles"`
+	// Passes is the total number of shared-resource slots ("通行名额")
+	// all characters in the room contend for.
+	Passes int `json:"passes"`
 }
 
 type CharState struct {
@@ -108,13 +125,18 @@ type CharState struct {
 	Y          int     `json:"y"`
 	Facing     Command `json:"facing"`
 	Energy     int     `json:"energy"`
+	Passes     int     `json:"passes"`
 	AppliedSeq int64   `json:"appliedSeq"`
 }
 
 type Snapshot struct {
 	Tick  int64       `json:"tick"`
 	Chars []CharState `json:"chars"`
-	Hash  string      `json:"hash"`
+	// PassesLeft is the remaining shared-resource pool. It is part of the
+	// authoritative state (and its hash) so every client folds the same
+	// adjudication instead of the last prediction that arrived.
+	PassesLeft int    `json:"passesLeft"`
+	Hash       string `json:"hash"`
 }
 
 // AppliedInput records that an input was processed at a specific tick.
@@ -133,7 +155,11 @@ type AppliedInput struct {
 	// AppliedRuleVersion is the version the authority actually used.
 	RuleVersion        int `json:"ruleVersion,omitempty"`
 	AppliedRuleVersion int `json:"appliedRuleVersion,omitempty"`
-	// Reason explains a rejection: "blocked" | "sealed" | "insufficient-energy".
+	// DependsOn mirrors the dependency declared on the input.
+	DependsOn int64 `json:"dependsOn,omitempty"`
+	// Reason explains a rejection: "blocked" | "sealed" |
+	// "insufficient-energy" | "resource-exhausted" | "dependency-rejected" |
+	// "claims-closed".
 	Reason string `json:"reason,omitempty"`
 	// NeedsReconfirm is set when an input formed under older rules was
 	// rejected because the current rules forbid it; the user must
@@ -150,18 +176,30 @@ type TickRecord struct {
 }
 
 type Room struct {
-	ID     string
-	Cfg    Config
-	Tick   int64
-	Chars  []*Char // fixed order, keeps iteration deterministic
-	Rules  Rules
-	byID   map[string]*Char
-	walls  map[[2]int]struct{}
-	sealed map[[2]int]struct{}
+	ID    string
+	Cfg   Config
+	Tick  int64
+	Chars []*Char // fixed order, keeps iteration deterministic
+	Rules Rules
+	// PassesLeft is the remaining shared-resource pool. Grants happen only
+	// inside ApplyTick, so a duplicate delivery or a late confirmation can
+	// never grant the same slot twice.
+	PassesLeft int
+	byID       map[string]*Char
+	walls      map[[2]int]struct{}
+	sealed     map[[2]int]struct{}
+	// outcomes records per-character accept/reject results of every applied
+	// input so that dependent inputs can be adjudicated. It is rebuilt
+	// deterministically by replay (same inputs -> same outcomes).
+	outcomes map[string]map[int64]bool
 }
 
 func NewRoom(id string, cfg Config, chars []*Char) *Room {
-	r := &Room{ID: id, Cfg: cfg, Chars: chars, byID: map[string]*Char{}, walls: map[[2]int]struct{}{}, sealed: map[[2]int]struct{}{}}
+	r := &Room{
+		ID: id, Cfg: cfg, Chars: chars, PassesLeft: cfg.Passes,
+		byID: map[string]*Char{}, walls: map[[2]int]struct{}{},
+		sealed: map[[2]int]struct{}{}, outcomes: map[string]map[int64]bool{},
+	}
 	for _, c := range chars {
 		r.byID[c.ID] = c
 		if c.Energy == 0 {
@@ -191,8 +229,11 @@ func (r *Room) SetRules(rules Rules) {
 // DefaultConfig is used by every freshly created room and by replays.
 func DefaultConfig() Config {
 	return Config{
-		Width:     18,
-		Height:    10,
+		Width:  18,
+		Height: 10,
+		// A single shared pass slot: exactly one character can hold it, so
+		// concurrent claims from both clients always produce a conflict.
+		Passes:    1,
 		Obstacles: [][2]int{{5, 2}, {5, 3}, {5, 4}, {12, 5}, {12, 6}, {12, 7}, {8, 7}, {9, 7}},
 	}
 }
@@ -240,44 +281,91 @@ func (r *Room) ApplyTick(inputs []Input) ([]AppliedInput, Snapshot) {
 			Tick: r.Tick, SessionID: in.SessionID, CharID: in.CharID,
 			Seq: in.Seq, Cmd: in.Cmd,
 			RuleVersion: in.RuleVersion, AppliedRuleVersion: r.Rules.Version,
+			DependsOn: in.DependsOn,
 		}
-		if in.Cmd != CmdWait {
-			c.Facing = in.Cmd
+		// A dependency on a rejected (or never executed) earlier action of
+		// the same session fails this input with its own explicit reason;
+		// unrelated inputs of the same session are unaffected.
+		depFailed := false
+		if in.DependsOn > 0 {
+			ok, known := r.outcomes[in.CharID][in.DependsOn]
+			depFailed = !known || !ok
 		}
-		nx, ny := c.X, c.Y
-		switch in.Cmd {
-		case CmdUp:
-			ny--
-		case CmdDown:
-			ny++
-		case CmdLeft:
-			nx--
-		case CmdRight:
-			nx++
-		}
-		cost := r.Rules.CostOf(in.Cmd)
 		switch {
-		case !r.passable(nx, ny, c.ID):
-			rec.Reason = "blocked"
-		case r.isSealed(nx, ny):
-			rec.Reason = "sealed"
-		case c.Energy < cost:
-			rec.Reason = "insufficient-energy"
+		case depFailed:
+			rec.Reason = "dependency-rejected"
+		case in.Cmd == CmdClaim:
+			r.adjudicateClaim(c, in, &rec)
 		default:
-			c.X, c.Y = nx, ny
-			c.Energy -= cost
-			rec.Accepted = true
+			r.adjudicateMove(c, in, &rec)
 		}
 		if !rec.Accepted && in.RuleVersion > 0 && in.RuleVersion < r.Rules.Version &&
-			(rec.Reason == "sealed" || rec.Reason == "insufficient-energy") {
+			(rec.Reason == "sealed" || rec.Reason == "insufficient-energy" || rec.Reason == "claims-closed") {
 			// Formed under older rules and forbidden by the current ones:
 			// the user must re-confirm explicitly under the new rules.
 			rec.NeedsReconfirm = true
 		}
 		rec.X, rec.Y = c.X, c.Y
 		applied = append(applied, rec)
+		if r.outcomes[in.CharID] == nil {
+			r.outcomes[in.CharID] = map[int64]bool{}
+		}
+		r.outcomes[in.CharID][in.Seq] = rec.Accepted
 	}
 	return applied, r.Snapshot()
+}
+
+// adjudicateClaim resolves a shared-resource claim. Within one tick inputs
+// run in (character declaration order, seq) order, so the first valid claim
+// wins the slot and every later claim — same tick or after exhaustion — is
+// rejected with an explicit reason. Arrival order plays no part here.
+func (r *Room) adjudicateClaim(c *Char, in Input, rec *AppliedInput) {
+	cost := r.Rules.CostOf(in.Cmd)
+	switch {
+	case r.Rules.ClaimsClosed:
+		rec.Reason = "claims-closed"
+	case c.Energy < cost:
+		rec.Reason = "insufficient-energy"
+	case r.PassesLeft <= 0:
+		rec.Reason = "resource-exhausted"
+	default:
+		r.PassesLeft--
+		c.Passes++
+		c.Energy -= cost
+		rec.Accepted = true
+	}
+}
+
+// adjudicateMove resolves a movement/wait command against bounds, walls,
+// sealed cells, collisions and energy costs.
+func (r *Room) adjudicateMove(c *Char, in Input, rec *AppliedInput) {
+	if in.Cmd != CmdWait {
+		c.Facing = in.Cmd
+	}
+	nx, ny := c.X, c.Y
+	switch in.Cmd {
+	case CmdUp:
+		ny--
+	case CmdDown:
+		ny++
+	case CmdLeft:
+		nx--
+	case CmdRight:
+		nx++
+	}
+	cost := r.Rules.CostOf(in.Cmd)
+	switch {
+	case !r.passable(nx, ny, c.ID):
+		rec.Reason = "blocked"
+	case r.isSealed(nx, ny):
+		rec.Reason = "sealed"
+	case c.Energy < cost:
+		rec.Reason = "insufficient-energy"
+	default:
+		c.X, c.Y = nx, ny
+		c.Energy -= cost
+		rec.Accepted = true
+	}
 }
 
 func (r *Room) charIndex(id string) int {
@@ -318,16 +406,18 @@ func (r *Room) Snapshot() Snapshot {
 	s := Snapshot{Tick: r.Tick, Chars: make([]CharState, 0, len(r.Chars))}
 	for _, c := range r.Chars {
 		s.Chars = append(s.Chars, CharState{
-			ID: c.ID, X: c.X, Y: c.Y, Facing: c.Facing, Energy: c.Energy, AppliedSeq: c.AppliedSeq,
+			ID: c.ID, X: c.X, Y: c.Y, Facing: c.Facing, Energy: c.Energy,
+			Passes: c.Passes, AppliedSeq: c.AppliedSeq,
 		})
 	}
+	s.PassesLeft = r.PassesLeft
 	return s
 }
 
 // Hash is a canonical content hash of a snapshot, independent of Go map
 // iteration order.
 func (s Snapshot) HashValue() string {
-	clone := Snapshot{Tick: s.Tick, Chars: s.Chars}
+	clone := Snapshot{Tick: s.Tick, Chars: s.Chars, PassesLeft: s.PassesLeft}
 	b, _ := json.Marshal(clone)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:16])
@@ -367,7 +457,7 @@ func ReplayJournal(id string, cfg Config, initial []*Char, events []JournalEvent
 		for _, a := range rec.Inputs {
 			inputs = append(inputs, Input{
 				SessionID: a.SessionID, CharID: a.CharID, Seq: a.Seq, Cmd: a.Cmd,
-				RuleVersion: a.RuleVersion,
+				RuleVersion: a.RuleVersion, DependsOn: a.DependsOn,
 			})
 		}
 		applied, snap := r.ApplyTick(inputs)

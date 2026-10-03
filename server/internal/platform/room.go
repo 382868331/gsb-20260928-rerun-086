@@ -301,14 +301,16 @@ func (ri *RoomInstance) rules() game.Rules {
 }
 
 // SwitchRules schedules a new rules version (sealed region and/or action
-// costs). It takes effect at the very next tick, is journaled, and forces
-// one tick immediately so the switch is durable and visible even when no
-// inputs are in flight. Returns the new rules.
-func (ri *RoomInstance) SwitchRules(sealed [][2]int, costs map[game.Command]int) game.Rules {
+// costs and/or closing shared-resource claims). It takes effect at the very
+// next tick, is journaled, and forces one tick immediately so the switch is
+// durable and visible even when no inputs are in flight. Returns the new
+// rules.
+func (ri *RoomInstance) SwitchRules(sealed [][2]int, costs map[game.Command]int, claimsClosed bool) game.Rules {
 	ri.mu.Lock()
 	next := ri.eng.Rules
 	next.Version++
 	next.Sealed = sealed
+	next.ClaimsClosed = claimsClosed
 	if costs != nil {
 		merged := map[game.Command]int{}
 		for k, v := range ri.eng.Rules.Costs {

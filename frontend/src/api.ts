@@ -57,6 +57,7 @@ export class GameClient {
 		seq: number,
 		cmd: string,
 		ruleVersion: number,
+		dependsOn = 0,
 		onDuplicate?: (status: number, result: EnqueueResult) => void,
 	): Promise<{ status: number; result: EnqueueResult | null; heldMs: number }> {
 		let resolveCall!: (v: { status: number; result: EnqueueResult | null; heldMs: number }) => void;
@@ -66,7 +67,7 @@ export class GameClient {
 			rejectCall = reject;
 		});
 		const run = this.sendChain.then(async () => {
-			const body = { sessionId: this.sessionId, charId: this.charId, seq, cmd, ruleVersion };
+			const body = { sessionId: this.sessionId, charId: this.charId, seq, cmd, ruleVersion, dependsOn };
 			try {
 				const heldMs = await this.weatherBlackout();
 				if (this.chaos.delayMs > 0) await sleep(this.chaos.delayMs);
@@ -170,16 +171,18 @@ export async function runReplay(roomId: string): Promise<ReplayResult> {
 }
 
 // changeRules asks the authority to switch to a new rules version (sealed
-// region and/or action costs). Returns the rules now in force.
+// region, action costs and/or closing shared-resource claims). Returns the
+// rules now in force.
 export async function changeRules(
 	roomId: string,
 	sealed: [number, number][],
 	costs: Partial<Record<Command, number>>,
+	claimsClosed = false,
 ): Promise<Rules> {
 	const resp = await fetch(`/api/rooms/${roomId}/rules`, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ sealed, costs }),
+		body: JSON.stringify({ sealed, costs, claimsClosed }),
 	});
 	if (!resp.ok) throw new Error(`rules switch failed: ${resp.status}`);
 	return (await resp.json()) as Rules;

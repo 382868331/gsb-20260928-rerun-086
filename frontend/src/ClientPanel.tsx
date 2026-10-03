@@ -34,11 +34,18 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 	const [view, setView] = useState<ClientViewState>(() => {
 		const restored = loadView(room.roomId, session.charId);
 		if (restored && restored.view.auth.some((c) => c.id === session.charId)) return restored.view;
-		return initialView(room.chars.map((c) => ({ id: c.id, x: c.x, y: c.y, facing: 'right', appliedSeq: 0 })), room.rules);
+		return initialView(
+			room.chars.map((c) => ({ id: c.id, x: c.x, y: c.y, facing: 'right', appliedSeq: 0 })),
+			room.rules,
+			room.config.passes ?? 0,
+		);
 	});
 	const [status, setStatus] = useState<TransportStatus>('connecting');
 	const seqRef = useRef(loadView(room.roomId, session.charId)?.nextSeq ?? 0);
 	const [notice, setNotice] = useState<string>('');
+	// When checked, the next issued action declares a dependency on the
+	// success of the previously issued one.
+	const [depNext, setDepNext] = useState(false);
 	const rulesVersionRef = useRef(view.rules.version);
 	useEffect(() => {
 		rulesVersionRef.current = view.rules.version;
@@ -58,8 +65,8 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 			client.lastTick = restored.view.tick;
 			restored.view.pending.forEach((p) => {
 				// Late confirmations for saved inputs: resend with the ORIGINAL
-				// rule basis; the authority decides which version to apply.
-				void client.sendInput(p.seq, p.cmd, p.ruleVersion).then(({ status: code, result }) => {
+				// rule basis and dependency; the authority decides the outcome.
+				void client.sendInput(p.seq, p.cmd, p.ruleVersion, p.dependsOn ?? 0).then(({ status: code, result }) => {
 					if (code === 403) duplicateSeen(`seq=${p.seq} 恢复重发被会话校验拒绝`);
 					else if (result?.status === 'stale') duplicateSeen(`seq=${p.seq} 恢复重发命中 stale，未重复执行`);
 				});
@@ -83,16 +90,16 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 		};
 	}, [client, cfg]);
 
-	async function issue(cmd: Command) {
+	async function issue(cmd: Command, dependsOn = 0) {
 		const seq = ++seqRef.current;
 		const basis = rulesVersionRef.current;
 		setView((prev) => {
-			const next = applyLocalInput(prev, client.charId, seq, cmd, cfg);
+			const next = applyLocalInput(prev, client.charId, seq, cmd, cfg, dependsOn);
 			saveView(room.roomId, client.charId, next, seqRef.current);
 			return next;
 		});
 		try {
-			const { status: code, result } = await client.sendInput(seq, cmd, basis, (_code, dup: EnqueueResult) => {
+			const { status: code, result } = await client.sendInput(seq, cmd, basis, dependsOn, (_code, dup: EnqueueResult) => {
 				duplicateSeen(`重复送达 seq=${seq}：服务端幂等响应 ${dup.status}`);
 			});
 			if (code === 403) {
@@ -112,10 +119,19 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 		setTimeout(() => setNotice(''), ms + 50);
 	}
 
+	// issueMaybeDep issues an action; when the dependency toggle is on it
+	// depends on the success of the previously issued action.
+	function issueMaybeDep(cmd: Command) {
+		const dep = depNext && seqRef.current > 0 ? seqRef.current : 0;
+		void issue(cmd, dep);
+	}
+
+	const charName = (id: string) => room.chars.find((c) => c.id === id)?.name ?? id;
+
 	function sendStale() {
 		// Manually redeliver the very first input again to prove idempotency.
 		const seq = Math.max(1, seqRef.current);
-		client.sendInput(seq, 'right', rulesVersionRef.current, (_c, r) => duplicateSeen(`手动重发 seq=${seq}：${r.status}`));
+		client.sendInput(seq, 'right', rulesVersionRef.current, 0, (_c, r) => duplicateSeen(`手动重发 seq=${seq}：${r.status}`));
 	}
 
 	function tryHijack() {
@@ -170,6 +186,8 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 			<span>已确认 seq: <b>{me?.appliedSeq ?? 0}</b></span>
 			<span>规则版本: <b>v{view.rules.version}</b></span>
 			<span>能量: <b>{me?.energy ?? 0}</b></span>
+			<span>剩余名额: <b className={view.passesLeft === 0 ? 'warn' : ''}>{view.passesLeft}</b></span>
+			<span>持有名额: <b>{me?.passes ?? 0}</b></span>
 			<span>待确认: <b className={predicting ? 'warn' : ''}>{view.pending.length}</b></span>
 		</div>
 		<div className="hash mono small">snapshot hash: {view.hash.slice(0, 20) || '…'}</div>
@@ -178,19 +196,42 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 			<ul className="pending-list">
 				{view.pending.map((p) => (
 					<li key={p.seq} className={p.ruleVersion < view.rules.version ? 'stale-basis' : ''}>
-						seq {p.seq} {p.cmd} → 预测 ({p.predX},{p.predY}) · 依据规则 v{p.ruleVersion}
+						seq {p.seq} {p.cmd} → {p.cmd === 'claim' ? '预测取得名额（待权威裁决）' : `预测 (${p.predX},${p.predY})`}
+						{p.dependsOn ? ` · 依赖 seq ${p.dependsOn}` : ''} · 依据规则 v{p.ruleVersion}
 						{p.ruleVersion < view.rules.version && `（当前 v${view.rules.version}，待权威判定）`}
 					</li>
 				))}
 			</ul>
 		)}
 
+		{view.claims.length > 0 && (
+			<div className="claims-list">
+				<div className="claims-title">共享名额裁决（权威结论，双客户端一致）</div>
+				{view.claims.slice(-5).map((v) => (
+					<div key={`${v.charId}-${v.seq}`} className={`claim-item ${v.granted ? 'granted' : 'denied'}`}>
+						tick {v.tick} · {charName(v.charId)} seq {v.seq}：
+						{v.granted ? '✓ 取得通行名额' : `✗ ${reasonLabel(v.reason ?? 'resource-exhausted')}`}
+						{v.ruleVersion ? `（依据 v${v.ruleVersion}，按 v${v.appliedRuleVersion ?? v.ruleVersion} 裁决）` : ''}
+					</div>
+				))}
+			</div>
+		)}
+
 		<div className="dpad">
 				{CMDS.map((c) => (
-					<button key={c.cmd} onClick={() => issue(c.cmd)}>
+					<button key={c.cmd} onClick={() => issueMaybeDep(c.cmd)}>
 					{c.label}
 				</button>
 			))}
+		</div>
+		<div className="claim-row">
+			<button className="claim-btn" onClick={() => issueMaybeDep('claim')} disabled={view.rules.claimsClosed}>
+				★ 领取通行名额{view.rules.claimsClosed ? '（规则已关闭）' : ''}
+			</button>
+			<label className="inline dep-toggle" title="勾选后，下一个动作依赖上一动作成功；若上一动作被权威拒绝，本动作获得独立的拒绝原因">
+				<input type="checkbox" checked={depNext} onChange={(e) => setDepNext(e.target.checked)} />
+				依赖上一动作
+			</label>
 		</div>
 		<div className="chaos-actions">
 			<button onClick={blink}>模拟短暂断开</button>

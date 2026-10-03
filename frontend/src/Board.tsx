@@ -21,6 +21,7 @@ const arrow: Record<Command, string> = {
 	left: '◀',
 	right: '▶',
 	wait: '•',
+	claim: '★',
 };
 
 export function Board(props: BoardProps) {
@@ -69,7 +70,7 @@ export function Board(props: BoardProps) {
 						title={predicted ? '本地预测位置（未经服务端确认）' : '服务端确认位置'}
 					>
 						<span>{arrow[facing]}</span>
-						<label>{meta.name}</label>
+						<label>{meta.name}{(st.passes ?? 0) > 0 ? ' ★' : ''}</label>
 					</div>
 				);
 			})}

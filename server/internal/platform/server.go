@@ -79,8 +79,9 @@ func (s *Server) getRoom(w http.ResponseWriter, r *http.Request) {
 }
 
 type rulesRequest struct {
-	Sealed [][2]int             `json:"sealed"`
-	Costs  map[game.Command]int `json:"costs"`
+	Sealed       [][2]int             `json:"sealed"`
+	Costs        map[game.Command]int `json:"costs"`
+	ClaimsClosed bool                 `json:"claimsClosed"`
 }
 
 // postRules switches the room's action rules to a new version (e.g. seal a
@@ -106,7 +107,7 @@ func (s *Server) postRules(w http.ResponseWriter, r *http.Request) {
 	}
 	for cmd, cost := range req.Costs {
 		switch cmd {
-		case game.CmdUp, game.CmdDown, game.CmdLeft, game.CmdRight, game.CmdWait:
+		case game.CmdUp, game.CmdDown, game.CmdLeft, game.CmdRight, game.CmdWait, game.CmdClaim:
 		default:
 			writeErr(w, 400, "unknown command in costs")
 			return
@@ -116,7 +117,7 @@ func (s *Server) postRules(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	rules := ri.SwitchRules(req.Sealed, req.Costs)
+	rules := ri.SwitchRules(req.Sealed, req.Costs, req.ClaimsClosed)
 	writeJSON(w, 200, rules)
 }
 
@@ -138,6 +139,9 @@ type inputRequest struct {
 	Cmd       game.Command `json:"cmd"`
 	// RuleVersion is the rules version the client based this input on.
 	RuleVersion int `json:"ruleVersion"`
+	// DependsOn is the seq of an earlier input of the same session whose
+	// success this input relies on (0 = independent).
+	DependsOn int64 `json:"dependsOn"`
 }
 
 func (s *Server) postInput(w http.ResponseWriter, r *http.Request) {
@@ -160,14 +164,14 @@ func (s *Server) postInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch req.Cmd {
-	case game.CmdUp, game.CmdDown, game.CmdLeft, game.CmdRight, game.CmdWait:
+	case game.CmdUp, game.CmdDown, game.CmdLeft, game.CmdRight, game.CmdWait, game.CmdClaim:
 	default:
 		writeErr(w, 400, "unknown command")
 		return
 	}
 	res := ri.enqueue(game.Input{
 		SessionID: req.SessionID, CharID: req.CharID, Seq: req.Seq, Cmd: req.Cmd,
-		RuleVersion: req.RuleVersion,
+		RuleVersion: req.RuleVersion, DependsOn: req.DependsOn,
 	})
 	code := 202
 	if res.Status == "forbidden" {

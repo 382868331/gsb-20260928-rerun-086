@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { applyAuthority, applyLocalInput, initialView, loadView, saveView } from './state';
-import type { AppliedInput, Snapshot } from './types';
+import type { AppliedInput, Command, Snapshot } from './types';
 
 function applied(seq: number, accepted: boolean, x: number, y: number, charId = 'c1'): AppliedInput {
 	return { tick: 1, sessionId: 's1', charId, seq, cmd: 'right', accepted, x, y };
@@ -222,5 +222,124 @@ describe('rule versioning', () => {
 		expect(restored?.view.rules.version).toBe(2);
 		expect(restored?.view.pending[0].ruleVersion).toBe(2);
 		expect(restored?.view.rejectedInputs[0].needsReconfirm).toBe(true);
+	});
+});
+
+describe('shared resource adjudication', () => {
+	function claimRec(seq: number, charId: string, accepted: boolean, tick: number, reason?: AppliedInput['reason']): AppliedInput {
+		return { tick, sessionId: `s-${charId}`, charId, seq, cmd: 'claim' as Command, accepted, x: 1, y: 1, reason };
+	}
+
+	it('predicts a claim locally without moving the character', () => {
+		const s = applyLocalInput(start(), 'c1', 1, 'claim', cfg);
+		expect(s.pending).toHaveLength(1);
+		expect(s.pending[0].cmd).toBe('claim');
+		expect([s.predX, s.predY]).toEqual([1, 1]);
+	});
+
+	it('folds the authority verdict when the OTHER client won the slot', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg); // formed offline
+		// Tick 1 (while c1 was offline): c2's claim was granted the only slot.
+		s = applyAuthority(s, 'c1', {
+			tick: 1, hash: 'h1', passesLeft: 0,
+			chars: [
+				{ id: 'c1', x: 1, y: 1, facing: 'right', appliedSeq: 0 },
+				{ id: 'c2', x: 4, y: 1, facing: 'left', appliedSeq: 1, passes: 1 },
+			],
+		}, [claimRec(1, 'c2', true, 1)], cfg);
+		expect(s.passesLeft).toBe(0);
+		expect(s.claims).toHaveLength(1);
+		expect(s.claims[0]).toMatchObject({ charId: 'c2', granted: true });
+		expect(s.pending).toHaveLength(1); // own claim still unconfirmed
+
+		// Tick 2: c1's claim is rejected — the pool was already empty.
+		s = applyAuthority(s, 'c1', {
+			tick: 2, hash: 'h2', passesLeft: 0,
+			chars: [
+				{ id: 'c1', x: 1, y: 1, facing: 'right', appliedSeq: 1 },
+				{ id: 'c2', x: 4, y: 1, facing: 'left', appliedSeq: 1, passes: 1 },
+			],
+		}, [claimRec(1, 'c1', false, 2, 'resource-exhausted')], cfg);
+		expect(s.pending).toHaveLength(0);
+		expect(s.claims).toHaveLength(2);
+		expect(s.claims[1]).toMatchObject({ charId: 'c1', granted: false, reason: 'resource-exhausted' });
+		// The rejection is recorded with its reason and never erased by the
+		// corrected (identical-looking) final state.
+		expect(s.rejectedInputs).toHaveLength(1);
+		expect(s.rejectedInputs[0].reason).toBe('resource-exhausted');
+		expect(s.rejectedInputs[0].msg).toContain('名额');
+		expect([s.predX, s.predY]).toEqual([1, 1]);
+	});
+
+	it('records a granted claim without a rejection entry', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg);
+		s = applyAuthority(s, 'c1', {
+			tick: 1, hash: 'h1', passesLeft: 0,
+			chars: [
+				{ id: 'c1', x: 1, y: 1, facing: 'right', appliedSeq: 1, passes: 1 },
+				{ id: 'c2', x: 4, y: 1, facing: 'left', appliedSeq: 0 },
+			],
+		}, [claimRec(1, 'c1', true, 1)], cfg);
+		expect(s.claims).toHaveLength(1);
+		expect(s.claims[0].granted).toBe(true);
+		expect(s.rejectedInputs).toHaveLength(0);
+		expect(s.passesLeft).toBe(0);
+	});
+
+	it('keeps dependency info and gives the dependent action its own reason', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg);
+		s = applyLocalInput(s, 'c1', 2, 'right', cfg, 1); // depends on seq 1
+		expect(s.pending[1].dependsOn).toBe(1);
+		s = applyAuthority(s, 'c1', {
+			tick: 1, hash: 'h-dep', passesLeft: 0,
+			chars: [
+				{ id: 'c1', x: 1, y: 1, facing: 'right', appliedSeq: 2 },
+				{ id: 'c2', x: 4, y: 1, facing: 'left', appliedSeq: 0, passes: 1 },
+			],
+		}, [
+			claimRec(1, 'c1', false, 1, 'resource-exhausted'),
+			{ ...applied(2, false, 1, 1), reason: 'dependency-rejected' as const, dependsOn: 1 },
+		], cfg);
+		expect(s.rejectedInputs).toHaveLength(2);
+		expect(s.rejectedInputs[0].reason).toBe('resource-exhausted');
+		expect(s.rejectedInputs[1].reason).toBe('dependency-rejected');
+		expect(s.rejectedInputs[1].dependsOn).toBe(1);
+	});
+
+	it('does not duplicate verdicts when a snapshot is folded twice', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg);
+		const snap: Snapshot = {
+			tick: 1, hash: 'h1', passesLeft: 0,
+			chars: [
+				{ id: 'c1', x: 1, y: 1, facing: 'right', appliedSeq: 1, passes: 1 },
+				{ id: 'c2', x: 4, y: 1, facing: 'left', appliedSeq: 0 },
+			],
+		};
+		s = applyAuthority(s, 'c1', snap, [claimRec(1, 'c1', true, 1)], cfg);
+		s = applyAuthority(s, 'c1', snap, [claimRec(1, 'c1', true, 1)], cfg);
+		expect(s.claims).toHaveLength(1);
+	});
+
+	it('save/restore keeps verdicts, pool state and pending dependencies', () => {
+		const store = new Map<string, string>();
+		vi.stubGlobal('localStorage', {
+			getItem: (key: string) => store.get(key) ?? null,
+			setItem: (key: string, value: string) => void store.set(key, value),
+		});
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg);
+		s = applyAuthority(s, 'c1', {
+			tick: 1, hash: 'h1', passesLeft: 0,
+			chars: [
+				{ id: 'c1', x: 1, y: 1, facing: 'right', appliedSeq: 1, passes: 1 },
+				{ id: 'c2', x: 4, y: 1, facing: 'left', appliedSeq: 0 },
+			],
+		}, [claimRec(1, 'c1', true, 1)], cfg);
+		s = applyLocalInput(s, 'c1', 2, 'right', cfg, 1);
+		saveView('room-res', 'c1', s, 2);
+		const restored = loadView('room-res', 'c1');
+		expect(restored?.view.passesLeft).toBe(0);
+		expect(restored?.view.claims).toHaveLength(1);
+		expect(restored?.view.claims[0].granted).toBe(true);
+		expect(restored?.view.pending[0].dependsOn).toBe(1);
 	});
 });

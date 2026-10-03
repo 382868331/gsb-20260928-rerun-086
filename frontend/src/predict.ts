@@ -19,6 +19,9 @@ export function step(
 	others: { x: number; y: number }[],
 	cfg: PredConfig,
 ): { x: number; y: number; moved: boolean } {
+	// A claim does not move the character; its outcome (slot granted or
+	// conflict) is decided by the authority, not by local prediction.
+	if (cmd === 'claim') return { x, y, moved: false };
 	let nx = x;
 	let ny = y;
 	if (cmd === 'up') ny--;
