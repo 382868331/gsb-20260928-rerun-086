@@ -1,4 +1,4 @@
-import type { AppliedInput, CharState, Command, PendingInput, RejectedInput, ResourceState, Rules, Snapshot } from './types';
+import type { AppliedInput, CharState, Command, PendingInput, RejectedInput, ResourceState, RoundView, Rules, Snapshot } from './types';
 import { step, type PredConfig } from './predict';
 
 export interface ClientViewState {
@@ -10,6 +10,8 @@ export interface ClientViewState {
 	rules: Rules;
 	// authoritative shared-resource state (grants, remaining units)
 	resources: ResourceState[];
+	// shared contention-round adjudication view (open rounds + history)
+	rounds: RoundView[];
 	// local pending inputs (predicted, not yet confirmed)
 	pending: PendingInput[];
 	// predicted position of the locally owned character (last unacked layer)
@@ -31,6 +33,7 @@ export function initialView(
 		hash: '',
 		rules: rules ?? { version: 1, costs: {} },
 		resources: resources ?? [],
+		rounds: [],
 		pending: [],
 		predX: initialAuth[0]?.x ?? 0,
 		predY: initialAuth[0]?.y ?? 0,
@@ -90,16 +93,29 @@ export function applyAuthority(
 	applied: AppliedInput[],
 	cfg: PredConfig,
 	rules?: Rules,
+	rounds?: RoundView[],
 ): ClientViewState {
 	const chars = snap.chars ?? [];
 	const me = chars.find((c) => c.id === charId);
 	if (!me || snap.tick < state.tick) return state;
 	const nextRules = rules ?? state.rules;
 	const nextResources = snap.resources ?? state.resources;
+	const nextRounds = rounds ?? state.rounds;
 	const effCfg = { ...cfg, sealed: nextRules.sealed };
+	// Claims collected into a still-open contention round are undecided:
+	// they must stay pending (never shown as successful) until the round
+	// closes and the authority settles them, even if a later seq of the
+	// same session was already applied.
+	const heldSeqs = new Set<number>();
+	for (const r of nextRounds) {
+		if (r.status !== 'open') continue;
+		for (const c of r.claims) {
+			if (c.charId === charId) heldSeqs.add(c.seq);
+		}
+	}
 	// Any pending input at or below the authority's ack is finished (confirmed
 	// or executed-but-blocked). Only still-in-flight seqs are re-predicted.
-	const stillPending = state.pending.filter((p) => p.seq > me.appliedSeq);
+	const stillPending = state.pending.filter((p) => p.seq > me.appliedSeq || heldSeqs.has(p.seq));
 	const mine = applied.filter((a) => a.charId === charId);
 	const settled = new Map(mine.map((a) => [a.seq, a]));
 	const rejectedInputs = [...state.rejectedInputs];
@@ -166,6 +182,7 @@ export function applyAuthority(
 		hash: snap.hash,
 		rules: nextRules,
 		resources: nextResources,
+		rounds: nextRounds,
 		pending: stillPending,
 		predX: px,
 		predY: py,
@@ -189,6 +206,8 @@ export function reasonLabel(reason: string): string {
 			return '拒绝（未知资源）';
 		case 'dependency-failed':
 			return '拒绝（依赖的前置动作未成功）';
+		case 'round-cancelled':
+			return '拒绝（本轮争用已取消/超时，未授予任何人）';
 		default:
 			return '阻挡';
 	}
@@ -207,6 +226,7 @@ export function saveView(roomId: string, charId: string, state: ClientViewState,
 			hash: state.hash,
 			rules: state.rules,
 			resources: state.resources,
+			rounds: state.rounds,
 			pending: state.pending,
 			predX: state.predX,
 			predY: state.predY,
@@ -226,6 +246,7 @@ export function loadView(roomId: string, charId: string): { view: ClientViewStat
 		parsed.view.rejectedInputs ??= [];
 		parsed.view.rules ??= { version: 1, costs: {} };
 		parsed.view.resources ??= [];
+		parsed.view.rounds ??= [];
 		parsed.view.lastCorrection = null;
 		return parsed;
 	} catch {

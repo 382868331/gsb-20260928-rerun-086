@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { applyAuthority, applyLocalInput, initialView, loadView, saveView } from './state';
-import type { AppliedInput, Snapshot } from './types';
+import type { AppliedInput, RoundView, Snapshot } from './types';
 
 function applied(seq: number, accepted: boolean, x: number, y: number, charId = 'c1'): AppliedInput {
 	return { tick: 1, sessionId: 's1', charId, seq, cmd: 'right', accepted, x, y };
@@ -138,6 +138,62 @@ describe('client prediction and authority reconciliation', () => {
 		expect(restored?.view.pending.map((p) => p.seq)).toEqual([1]);
 		expect(restored?.view.auth.find((c) => c.id === 'c1')?.appliedSeq).toBe(0);
 		expect([restored?.view.predX ?? 0, restored?.view.predY ?? 0]).toEqual([2, 1]);
+	});
+});
+
+describe('contention rounds', () => {
+	const openRound: RoundView = {
+		id: 'pass#1',
+		resource: 'pass',
+		status: 'open',
+		openTick: 1,
+		deadlineMs: Date.now() + 2500,
+		claims: [{ charId: 'c1', seq: 1, ruleVersion: 1 }],
+		waitingFor: ['c2'],
+	};
+
+	it('keeps a round-held claim pending even when a later seq is applied', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg, { resource: 'pass' });
+		s = applyLocalInput(s, 'c1', 2, 'right', cfg);
+		const snap: Snapshot = {
+			tick: 3,
+			hash: 'h',
+			chars: [
+				{ id: 'c1', x: 2, y: 1, facing: 'right', appliedSeq: 2 },
+				{ id: 'c2', x: 4, y: 1, facing: 'left', appliedSeq: 0 },
+			],
+		};
+		// seq 2 was applied while the claim (seq 1) is still collected in an
+		// open round: it must NOT be treated as confirmed/successful.
+		s = applyAuthority(s, 'c1', snap, [applied(2, true, 2, 1)], cfg, undefined, [openRound]);
+		expect(s.pending.map((p) => p.seq)).toEqual([1]);
+		expect(s.rounds[0].status).toBe('open');
+	});
+
+	it('settles the held claim when the round closes with a rejection', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg, { resource: 'pass' });
+		const snap: Snapshot = {
+			tick: 4,
+			hash: 'h2',
+			chars: [
+				{ id: 'c1', x: 1, y: 1, facing: 'right', appliedSeq: 1 },
+				{ id: 'c2', x: 4, y: 1, facing: 'left', appliedSeq: 0 },
+			],
+		};
+		const verdict: AppliedInput = {
+			...applied(1, false, 1, 1),
+			cmd: 'claim',
+			resource: 'pass',
+			reason: 'round-cancelled',
+			needsReconfirm: true,
+		};
+		s = applyAuthority(s, 'c1', snap, [verdict], cfg, undefined, [
+			{ ...openRound, status: 'cancelled', closeReason: 'deadline', waitingFor: [], missing: ['c2'] },
+		]);
+		expect(s.pending).toHaveLength(0);
+		expect(s.rejectedInputs).toHaveLength(1);
+		expect(s.rejectedInputs[0].reason).toBe('round-cancelled');
+		expect(s.rejectedInputs[0].needsReconfirm).toBe(true);
 	});
 });
 

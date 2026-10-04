@@ -173,6 +173,37 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .resource-line .warn {
 	color: #fbbf24;
 }
+
+.rounds {
+	margin: 6px 0;
+	padding: 6px 8px;
+	border: 1px solid #334155;
+	border-radius: 6px;
+	font-size: 12px;
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+}
+.rounds-title { color: var(--muted); }
+.round-line { line-height: 1.6; }
+.round-line.open { color: #e2e8f0; }
+.round-line.open .warn { color: #fbbf24; }
+.round-line.adjudicated { color: var(--ok); }
+.round-line.cancelled { color: var(--warn); }
+.round-line .muted { color: var(--muted); }
+.round-line .reconfirm { margin-left: 8px; }
+
+.new-room {
+	margin-left: auto;
+	font-size: 12px;
+	padding: 4px 10px;
+	border-radius: 6px;
+	border: 1px solid #475569;
+	background: transparent;
+	color: #cbd5f5;
+	cursor: pointer;
+}
+.new-room:hover { background: rgba(148, 163, 184, .12); }
 .inline {
 	display: inline-flex;
 	align-items: center;

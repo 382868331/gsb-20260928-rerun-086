@@ -172,6 +172,22 @@ export async function createRoom(): Promise<RoomInfo> {
 	return (await resp.json()) as RoomInfo;
 }
 
+// getRoom rejoins an existing room (after a page refresh or a server
+// restart); throws when the room no longer exists.
+export async function getRoom(roomId: string): Promise<RoomInfo> {
+	const resp = await fetch(`/api/rooms/${roomId}`);
+	if (!resp.ok) throw new Error(`get room failed: ${resp.status}`);
+	return (await resp.json()) as RoomInfo;
+}
+
+// cancelRound explicitly cancels an open contention round: collected
+// claims are refused with "round-cancelled" instead of being silently
+// decided by arrival order.
+export async function cancelRound(roomId: string, roundId: string): Promise<void> {
+	const resp = await fetch(`/api/rooms/${roomId}/rounds/${encodeURIComponent(roundId)}/cancel`, { method: 'POST' });
+	if (!resp.ok) throw new Error(`cancel round failed: ${resp.status}`);
+}
+
 export async function runReplay(roomId: string): Promise<ReplayResult> {
 	const resp = await fetch(`/api/rooms/${roomId}/replay`, { method: 'POST' });
 	if (!resp.ok) throw new Error(`replay failed: ${resp.status}`);

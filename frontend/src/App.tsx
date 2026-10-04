@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { changeRules, createRoom, runReplay, type ChaosConfig, defaultChaos } from './api';
+import { changeRules, createRoom, getRoom, runReplay, type ChaosConfig, defaultChaos } from './api';
 import { ClientPanel } from './ClientPanel';
 import type { Command, ReplayResult, RoomInfo } from './types';
 
@@ -17,6 +17,8 @@ interface LogLine {
 	at: number;
 }
 
+const ROOM_STORAGE_KEY = 'gameplatform:room';
+
 export default function App() {
 	const [room, setRoom] = useState<RoomInfo | null>(null);
 	const [error, setError] = useState<string>('');
@@ -33,13 +35,37 @@ export default function App() {
 	}
 
 	useEffect(() => {
-		createRoom()
+		// Refresh restores the previous room and sessions instead of
+		// abandoning them: unconfirmed predictions and the recovery queue
+		// keep their identity and continue to settle against the same room.
+		const savedRoomId = localStorage.getItem(ROOM_STORAGE_KEY);
+		const boot = savedRoomId
+			? getRoom(savedRoomId).catch(() => {
+					localStorage.removeItem(ROOM_STORAGE_KEY);
+					return createRoom();
+				})
+			: createRoom();
+		boot
 			.then((info) => {
+				localStorage.setItem(ROOM_STORAGE_KEY, info.roomId);
 				setRoom(info);
-				pushLog(`房间已创建：${info.roomId}（两个角色、两个会话）`, 'ok');
+				pushLog(
+					savedRoomId === info.roomId
+						? `已恢复原房间：${info.roomId}（会话与待确认队列继续核对）`
+						: `房间已创建：${info.roomId}（两个角色、两个会话）`,
+					'ok',
+				);
 			})
 			.catch((e) => setError(`无法连接 Go 权威服务：${String(e)}`));
 	}, []);
+
+	function newRoom() {
+		// Abandon the current room: clear every persisted view and reboot.
+		for (const key of Object.keys(localStorage)) {
+			if (key.startsWith('gameplatform:')) localStorage.removeItem(key);
+		}
+		location.reload();
+	}
 
 	useEffect(() => {
 		if (!autoReplay || !room) return;
@@ -84,6 +110,7 @@ export default function App() {
 			<header className="topbar">
 				<h1>游戏服务研发平台 · 虚拟角色状态同步</h1>
 				<div className="room mono small">room {room.roomId}</div>
+				<button className="new-room" onClick={newRoom}>新建房间（放弃当前）</button>
 			</header>
 
 			<section className="controls">

@@ -26,6 +26,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/rooms/{id}/events", s.events)
 	mux.HandleFunc("POST /api/rooms/{id}/inputs", s.postInput)
 	mux.HandleFunc("POST /api/rooms/{id}/rules", s.postRules)
+	mux.HandleFunc("POST /api/rooms/{id}/rounds/{rid}/cancel", s.cancelRound)
 	mux.HandleFunc("GET /api/rooms/{id}/journal", s.journal)
 	mux.HandleFunc("POST /api/rooms/{id}/replay", s.replay)
 	return withCommonHeaders(mux)
@@ -65,6 +66,7 @@ type roomInfoResponse struct {
 	Snapshot  game.Snapshot       `json:"snapshot"`
 	Rules     game.Rules          `json:"rules"`
 	Resources []game.ResourceSpec `json:"resources"`
+	Rounds    []RoundView         `json:"rounds"`
 }
 
 func (s *Server) getRoom(w http.ResponseWriter, r *http.Request) {
@@ -76,8 +78,24 @@ func (s *Server) getRoom(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, roomInfoResponse{
 		RoomID: ri.ID, Config: ri.Cfg, Chars: ri.Views,
 		Sessions: ri.Sessions, Snapshot: ri.snapshot(), Rules: ri.rules(),
-		Resources: ri.Cfg.Resources,
+		Resources: ri.Cfg.Resources, Rounds: ri.Rounds(),
 	})
+}
+
+// cancelRound explicitly cancels an open contention round: the collected
+// claims are refused with "round-cancelled" and the resource stays
+// ungranted, instead of letting arrival order decide silently.
+func (s *Server) cancelRound(w http.ResponseWriter, r *http.Request) {
+	ri, err := s.roomOrLoad(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, 404, "room not found")
+		return
+	}
+	if !ri.CancelRound(r.PathValue("rid")) {
+		writeErr(w, 404, "no open round with that id")
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "cancelled"})
 }
 
 type rulesRequest struct {

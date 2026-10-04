@@ -3,6 +3,7 @@ package platform
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -64,7 +65,10 @@ func (m *Manager) CreateRoom() (*RoomInstance, CreatedRoom, error) {
 		eng:        game.NewRoom(roomID, cfg, chars),
 		journal:    journal,
 		admitted:   map[string]int64{},
+		progress:   map[string]int64{},
 		waiting:    map[string]map[int64]game.Input{},
+		rounds:     map[string]*ClaimRound{},
+		roundSeq:   map[string]int{},
 		subs:       map[int]chan pubMsg{},
 		lastActive: time.Now(),
 	}
@@ -84,7 +88,10 @@ func (m *Manager) tickLoop(ri *RoomInstance) {
 			ri.mu.Unlock()
 			return
 		}
-		hasPending := len(ri.pending) > 0
+		// A round that reached its collection boundary needs a tick to
+		// close even when no new input arrived; rounds still collecting
+		// wait without journaling empty ticks.
+		hasPending := len(ri.pending) > 0 || ri.roundClosableLocked()
 		if hasPending {
 			ri.lastActive = time.Now()
 		}
@@ -101,7 +108,7 @@ func (m *Manager) tickLoop(ri *RoomInstance) {
 		snap.Hash = snap.HashValue()
 		// Applied must serialize as [] not null: idle heartbeats reach the
 		// client too, and a null field crashes the snapshot folding there.
-		ev := snapshotEvent{Type: "snapshot", Snapshot: snap, Applied: []game.AppliedInput{}, Rules: ri.eng.Rules}
+		ev := snapshotEvent{Type: "snapshot", Snapshot: snap, Applied: []game.AppliedInput{}, Rules: ri.eng.Rules, Rounds: ri.roundViewsLocked()}
 		payload, _ := json.Marshal(ev)
 		ri.publishLocked(pubMsg{id: ri.nextEvtID, tick: snap.Tick, payload: payload})
 		ringsNext := ri.nextEvtID
@@ -138,6 +145,7 @@ func (m *Manager) LoadRoom(id string) error {
 		initEntry store.InitEntry
 		events    []game.JournalEvent
 		queued    []game.Input
+		rounds    []ClaimRound
 	)
 	err := store.ReadEntries(m.dir, id, func(line []byte) error {
 		var head struct {
@@ -173,6 +181,12 @@ func (m *Manager) LoadRoom(id string) error {
 				return err
 			}
 			queued = append(queued, e.Input)
+		case "round":
+			var e roundJournalEntry
+			if err := json.Unmarshal(line, &e); err != nil {
+				return err
+			}
+			rounds = append(rounds, e.Round)
 		}
 		return nil
 	})
@@ -234,8 +248,45 @@ func (m *Manager) LoadRoom(id string) error {
 	ri := &RoomInstance{
 		ID: id, Cfg: cfg, Chars: restoredChars, Views: views, Sessions: sessions,
 		eng: restored, journal: journal,
-		admitted: map[string]int64{}, waiting: map[string]map[int64]game.Input{},
+		admitted: map[string]int64{}, progress: map[string]int64{},
+		waiting: map[string]map[int64]game.Input{},
+		rounds:  map[string]*ClaimRound{}, roundSeq: map[string]int{},
 		subs: map[int]chan pubMsg{}, nextEvtID: int64(nTicks), lastActive: time.Now(),
+	}
+	for _, c := range restoredChars {
+		ri.progress[c.ID] = c.AppliedSeq
+	}
+	// Restore contention-round identity counters and history from the
+	// journaled round events, then reopen rounds that were still open.
+	// Open rounds are restored as empty shells: their collected claims are
+	// re-admitted from the journaled queued entries below, which rejoins
+	// them to the same round identity deterministically.
+	for _, round := range rounds {
+		var n int
+		if _, err := fmt.Sscanf(round.ID, round.Resource+"#%d", &n); err == nil && n > ri.roundSeq[round.Resource] {
+			ri.roundSeq[round.Resource] = n
+		}
+	}
+	for i := range rounds {
+		round := rounds[i]
+		if round.Status != "open" {
+			delete(ri.rounds, round.Resource)
+			history := round
+			ri.roundHistory = append(ri.roundHistory, &history)
+			continue
+		}
+		shell := &ClaimRound{
+			ID: round.ID, Resource: round.Resource, Status: "open",
+			OpenTick: round.OpenTick, DeadlineMs: round.DeadlineMs,
+			Claims: []game.Input{}, WaitingFor: []string{},
+		}
+		for _, ch := range restoredChars {
+			shell.WaitingFor = append(shell.WaitingFor, ch.ID)
+		}
+		ri.rounds[round.Resource] = shell
+	}
+	if len(ri.roundHistory) > 16 {
+		ri.roundHistory = ri.roundHistory[len(ri.roundHistory)-16:]
 	}
 	for _, in := range liveQueued {
 		ri.enqueueLocked(in, false)

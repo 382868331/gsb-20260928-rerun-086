@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { GameClient, type ChaosConfig, type TransportStatus } from './api';
+import { cancelRound, GameClient, type ChaosConfig, type TransportStatus } from './api';
 import { Board } from './Board';
 import { applyAuthority, applyLocalInput, initialView, loadView, reasonLabel, saveView, type ClientViewState } from './state';
-import type { Command, EnqueueResult, RoomInfo, SnapshotEvent } from './types';
+import type { Command, EnqueueResult, RoomInfo, RoundView, SnapshotEvent } from './types';
 
 interface Props {
 	room: RoomInfo;
@@ -41,6 +41,7 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 			initialResources,
 		);
 	});
+	const [restoredFromDisk] = useState(() => loadView(room.roomId, session.charId) !== null);
 	const [status, setStatus] = useState<TransportStatus>('connecting');
 	const seqRef = useRef(loadView(room.roomId, session.charId)?.nextSeq ?? 0);
 	const [notice, setNotice] = useState<string>('');
@@ -80,7 +81,7 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 				);
 			}
 			setView((prev) => {
-				return applyAuthority(prev, client.charId, ev.snapshot, ev.applied ?? [], cfg, ev.rules);
+				return applyAuthority(prev, client.charId, ev.snapshot, ev.applied ?? [], cfg, ev.rules, ev.rounds);
 			});
 		});
 		const offStatus = client.onStatus(setStatus);
@@ -148,6 +149,10 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 
 	const me = view.auth.find((c) => c.id === client.charId);
 	const predicting = view.pending.length > 0;
+	const charName = (id: string) => room.chars.find((c) => c.id === id)?.name ?? id;
+	const resourceName = (id: string) => room.resources.find((r) => r.id === id)?.name ?? id;
+	const openRoundOf = (seq: number) =>
+		view.rounds.find((r) => r.status === 'open' && r.claims.some((c) => c.charId === client.charId && c.seq === seq));
 	return (
 		<section className="panel">
 			<header className="panel-head">
@@ -195,9 +200,31 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 					<li key={p.seq} className={p.ruleVersion < view.rules.version ? 'stale-basis' : ''}>
 						seq {p.seq} {p.cmd} → 预测 ({p.predX},{p.predY}) · 依据规则 v{p.ruleVersion}
 						{p.ruleVersion < view.rules.version && `（当前 v${view.rules.version}，待权威判定）`}
+						{p.cmd === 'claim' && openRoundOf(p.seq) && ` · 轮 ${openRoundOf(p.seq)!.id} 裁决中`}
 					</li>
 				))}
 			</ul>
+		)}
+		{restoredFromDisk && (
+			<div className="notice">已从本地恢复会话与待确认队列（刷新不新建房间，继续核对原预测）。</div>
+		)}
+		{view.rounds.length > 0 && (
+			<div className="rounds">
+				<div className="rounds-title">共享裁决明细（两端一致）：</div>
+				{view.rounds.map((r) => (
+					<RoundLine
+						key={r.id}
+						round={r}
+						charName={charName}
+						resourceName={resourceName}
+						onCancel={() => {
+							cancelRound(room.roomId, r.id)
+								.then(() => duplicateSeen(`已显式取消争用轮 ${r.id}，收集的预测将以 round-cancelled 拒绝`))
+								.catch((e) => duplicateSeen(`取消轮 ${r.id} 失败：${String(e)}`));
+						}}
+					/>
+				))}
+			</div>
 		)}
 
 		<div className="dpad">
@@ -278,4 +305,46 @@ function statusLabel(s: TransportStatus): string {
 		case 'reconnecting': return '重连中（按权威 tick 续传）';
 		case 'disconnected': return '短暂断开';
 	}
+}
+
+function RoundLine({
+	round,
+	charName,
+	resourceName,
+	onCancel,
+}: {
+	round: RoundView;
+	charName: (id: string) => string;
+	resourceName: (id: string) => string;
+	onCancel: () => void;
+}) {
+	const claims = round.claims.map((c) => `${charName(c.charId)} seq ${c.seq}（依据 v${c.ruleVersion}）`).join('、');
+	if (round.status === 'open') {
+		return (
+			<div className="round-line open">
+				轮 <b>{round.id}</b>（{resourceName(round.resource)}）裁决中：已收集 {claims || '无'}
+				{round.waitingFor.length > 0 && (
+					<span className="warn">，等待 {round.waitingFor.map(charName).join('、')} 的输入</span>
+				)}
+				<span className="muted"> · 截止 {new Date(round.deadlineMs).toLocaleTimeString()}</span>
+				<button className="reconfirm" onClick={onCancel}>取消本轮</button>
+			</div>
+		);
+	}
+	if (round.status === 'adjudicated') {
+		return (
+			<div className="round-line adjudicated">
+				轮 <b>{round.id}</b>（{resourceName(round.resource)}）已裁决（{round.closeReason === 'complete' ? '全员到齐' : round.closeReason}）：
+				胜者 <b>{round.winner ? charName(round.winner) : '无'}</b>；参与 {claims || '无'}
+			</div>
+		);
+	}
+	return (
+		<div className="round-line cancelled">
+			轮 <b>{round.id}</b>（{resourceName(round.resource)}）已取消（
+			{round.closeReason === 'deadline' ? '收集超时' : '手动取消'}）
+			{round.missing && round.missing.length > 0 && `，缺少 ${round.missing.map(charName).join('、')} 的输入`}
+			：未授予任何人；参与 {claims || '无'}
+		</div>
+	);
 }

@@ -47,6 +47,15 @@ type Input struct {
 	// it was formed (0 = legacy/unversioned). The authority never rewrites
 	// it; it decides explicitly which version to apply.
 	RuleVersion int `json:"ruleVersion,omitempty"`
+	// RoundID is the persistable identity of the contention round this
+	// claim was collected into (cmd == claim). It is assigned by the
+	// authority when the claim joins the round and is journaled with the
+	// applied record, so replay and restart re-derive the same verdict.
+	RoundID string `json:"roundId,omitempty"`
+	// Cancelled marks a claim whose contention round was cancelled before
+	// adjudication (collection deadline passed or explicit cancel). It is
+	// refused with reason "round-cancelled" instead of being adjudicated.
+	Cancelled bool `json:"cancelled,omitempty"`
 }
 
 // ResourceSpec declares one shared finite resource of a room.
@@ -179,13 +188,17 @@ type AppliedInput struct {
 	AppliedRuleVersion int `json:"appliedRuleVersion,omitempty"`
 	// Reason explains a rejection: "blocked" | "sealed" |
 	// "insufficient-energy" | "resource-exhausted" | "already-claimed" |
-	// "unknown-resource" | "dependency-failed".
+	// "unknown-resource" | "dependency-failed" | "round-cancelled".
 	Reason string `json:"reason,omitempty"`
 	// NeedsReconfirm is set when an input formed under older rules was
 	// rejected because the current rules forbid it; the user must
 	// explicitly re-confirm it under the new rules instead of the
 	// authority silently rewriting the original input.
 	NeedsReconfirm bool `json:"needsReconfirm,omitempty"`
+	// RoundID is the contention round this claim was adjudicated in.
+	RoundID string `json:"roundId,omitempty"`
+	// Cancelled mirrors Input.Cancelled so replay reproduces the record.
+	Cancelled bool `json:"cancelled,omitempty"`
 }
 
 // TickRecord is one deterministic append-only event in the room journal.
@@ -196,17 +209,17 @@ type TickRecord struct {
 }
 
 type Room struct {
-	ID     string
-	Cfg    Config
-	Tick   int64
-	Chars  []*Char // fixed order, keeps iteration deterministic
-	Rules  Rules
-	byID       map[string]*Char
-	walls      map[[2]int]struct{}
-	sealed     map[[2]int]struct{}
-	resources  map[string]*ResourceState
-	resOrder   []string // config declaration order, keeps snapshots deterministic
-	outcomes   map[string]map[int64]bool // charId -> seq -> accepted, for dependencies
+	ID        string
+	Cfg       Config
+	Tick      int64
+	Chars     []*Char // fixed order, keeps iteration deterministic
+	Rules     Rules
+	byID      map[string]*Char
+	walls     map[[2]int]struct{}
+	sealed    map[[2]int]struct{}
+	resources map[string]*ResourceState
+	resOrder  []string                  // config declaration order, keeps snapshots deterministic
+	outcomes  map[string]map[int64]bool // charId -> seq -> accepted, for dependencies
 }
 
 func NewRoom(id string, cfg Config, chars []*Char) *Room {
@@ -307,11 +320,18 @@ func (r *Room) ApplyTick(inputs []Input) ([]AppliedInput, Snapshot) {
 			Tick: r.Tick, SessionID: in.SessionID, CharID: in.CharID,
 			Seq: in.Seq, Cmd: in.Cmd, Resource: in.Resource, DependsOn: in.DependsOn,
 			RuleVersion: in.RuleVersion, AppliedRuleVersion: r.Rules.Version,
+			RoundID: in.RoundID, Cancelled: in.Cancelled,
 		}
 		if in.Cmd == CmdUp || in.Cmd == CmdDown || in.Cmd == CmdLeft || in.Cmd == CmdRight {
 			c.Facing = in.Cmd
 		}
 		switch {
+		case in.Cancelled:
+			// The contention round was cancelled before adjudication
+			// (collection deadline passed or explicit cancel): the claim is
+			// refused, never granted, and the user may re-issue it.
+			rec.Reason = "round-cancelled"
+			rec.NeedsReconfirm = true
 		case r.dependencyFailed(in):
 			// The earlier action this input relied on did not succeed (e.g.
 			// another client won the shared resource). Refuse with an
@@ -508,6 +528,7 @@ func ReplayJournal(id string, cfg Config, initial []*Char, events []JournalEvent
 				SessionID: a.SessionID, CharID: a.CharID, Seq: a.Seq, Cmd: a.Cmd,
 				Resource: a.Resource, DependsOn: a.DependsOn,
 				RuleVersion: a.RuleVersion,
+				RoundID:     a.RoundID, Cancelled: a.Cancelled,
 			})
 		}
 		applied, snap := r.ApplyTick(inputs)
