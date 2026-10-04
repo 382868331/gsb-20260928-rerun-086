@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -63,6 +64,61 @@ func TestLoadRoomRestoresAndContinues(t *testing.T) {
 	}
 	if !rep.Match {
 		t.Fatalf("replay after restart mismatch: %+v", rep)
+	}
+}
+
+// A page refresh (or full server restart) must reattach to the SAME room
+// and sessions via GET /api/rooms/{id}: the new server process reloads
+// the room from its journal instead of creating a fresh one.
+func TestGetRoomResumesAfterServerRestart(t *testing.T) {
+	c, srv := newTestServer(t)
+	info := createRoom(t, c)
+	s := info.Sessions[0]
+	postInput(t, c, info.ID, map[string]interface{}{
+		"sessionId": s.ID, "charId": s.CharID, "seq": 1, "cmd": "right",
+	})
+	// An unconfirmed (queued, gap-blocked) input is in flight.
+	postInput(t, c, info.ID, map[string]interface{}{
+		"sessionId": s.ID, "charId": s.CharID, "seq": 3, "cmd": "up",
+	})
+	time.Sleep(350 * time.Millisecond)
+
+	// Brand-new server process over the same data dir.
+	s2 := NewServer(srv.mgr.dir)
+	c2 := testClient{h: s2.Routes()}
+	rw := c2.do("GET", "/api/rooms/"+info.ID, nil)
+	if rw.Code != 200 {
+		t.Fatalf("resume code = %d, want 200", rw.Code)
+	}
+	var resumed roomInfoResponse
+	if err := json.Unmarshal(rw.Body.Bytes(), &resumed); err != nil {
+		t.Fatal(err)
+	}
+	if resumed.RoomID != info.ID || len(resumed.Sessions) != 2 {
+		t.Fatalf("resumed room = %+v", resumed)
+	}
+	if resumed.Sessions[0].ID != info.Sessions[0].ID || resumed.Sessions[1].ID != info.Sessions[1].ID {
+		t.Fatalf("sessions changed across restart: %+v", resumed.Sessions)
+	}
+	if resumed.Snapshot.Chars[0].AppliedSeq != 1 {
+		t.Fatalf("resumed snapshot = %+v, want appliedSeq 1", resumed.Snapshot)
+	}
+	// The queued input resumes on the restored room: fill the gap and it
+	// executes without recreating anything.
+	postInput(t, c2, info.ID, map[string]interface{}{
+		"sessionId": s.ID, "charId": s.CharID, "seq": 2, "cmd": "left",
+	})
+	time.Sleep(350 * time.Millisecond)
+	ri, err := s2.mgr.Get(info.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if me := ri.eng.Chars[0]; me.AppliedSeq != 3 {
+		t.Fatalf("queued input did not resume after restart: appliedSeq = %d", me.AppliedSeq)
+	}
+	// Unknown rooms still 404 so the client falls back to a fresh room.
+	if rw := c2.do("GET", "/api/rooms/room_gone", nil); rw.Code != 404 {
+		t.Fatalf("unknown room code = %d, want 404", rw.Code)
 	}
 }
 

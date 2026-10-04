@@ -310,3 +310,149 @@ describe('shared resource claims', () => {
 		expect(s.resources[0].holders[0].charId).toBe('c1');
 	});
 });
+
+describe('contention rounds', () => {
+	const pass = (remaining: number, holders: { charId: string; seq: number; tick: number }[] = []) => ({
+		id: 'pass',
+		name: '通行名额',
+		total: 1,
+		remaining,
+		holders,
+	});
+	const round = (over: Partial<import('./types').RoundState> = {}): import('./types').RoundState => ({
+		id: 'pass-r1',
+		resource: 'pass',
+		state: 'collecting',
+		openTick: 1,
+		closeTick: 3,
+		claimants: [],
+		...over,
+	});
+	const charsAfter = (appliedSeq: number) => [
+		{ id: 'c1', x: 1, y: 1, facing: 'right' as const, appliedSeq },
+		{ id: 'c2', x: 4, y: 1, facing: 'left' as const, appliedSeq: 0 },
+	];
+
+	it('keeps a collected claim undecided: not confirmed, not rejected', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg, { resource: 'pass' });
+		const snap: Snapshot = {
+			tick: 1, hash: 'h-col', resources: [pass(1)], rounds: [round()], chars: charsAfter(1),
+		};
+		const collected: AppliedInput = {
+			tick: 1, sessionId: 's1', charId: 'c1', seq: 1, cmd: 'claim', resource: 'pass',
+			accepted: false, x: 1, y: 1, collected: true, roundId: 'pass-r1',
+		};
+		s = applyAuthority(s, 'c1', snap, [collected], cfg);
+		expect(s.pending).toHaveLength(0);
+		expect(s.adjudicating).toHaveLength(1);
+		expect(s.adjudicating[0].roundId).toBe('pass-r1');
+		expect(s.rejectedInputs).toHaveLength(0);
+		expect(s.rounds[0].id).toBe('pass-r1');
+	});
+
+	it('settles a lost verdict with its reason and round identity', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg, { resource: 'pass' });
+		s = applyAuthority(
+			s, 'c1',
+			{ tick: 1, hash: 'h1', resources: [pass(1)], rounds: [round()], chars: charsAfter(1) },
+			[{ tick: 1, sessionId: 's1', charId: 'c1', seq: 1, cmd: 'claim', resource: 'pass', accepted: false, x: 1, y: 1, collected: true, roundId: 'pass-r1' }],
+			cfg,
+		);
+		const verdictSnap: Snapshot = {
+			tick: 3, hash: 'h3',
+			resources: [pass(0, [{ charId: 'c2', seq: 1, tick: 3 }])],
+			rounds: [],
+			chars: charsAfter(1),
+		};
+		const verdict: AppliedInput = {
+			tick: 3, sessionId: 's1', charId: 'c1', seq: 1, cmd: 'claim', resource: 'pass',
+			accepted: false, x: 1, y: 1, derived: true, roundId: 'pass-r1', reason: 'resource-exhausted',
+		};
+		s = applyAuthority(s, 'c1', verdictSnap, [verdict], cfg);
+		expect(s.adjudicating).toHaveLength(0);
+		expect(s.rejectedInputs).toHaveLength(1);
+		expect(s.rejectedInputs[0].reason).toBe('resource-exhausted');
+		expect(s.rejectedInputs[0].msg).toContain('pass-r1');
+	});
+
+	it('grants a won verdict without a rejection record', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg, { resource: 'pass' });
+		s = applyAuthority(
+			s, 'c1',
+			{ tick: 1, hash: 'h1', resources: [pass(1)], rounds: [round()], chars: charsAfter(1) },
+			[{ tick: 1, sessionId: 's1', charId: 'c1', seq: 1, cmd: 'claim', resource: 'pass', accepted: false, x: 1, y: 1, collected: true, roundId: 'pass-r1' }],
+			cfg,
+		);
+		s = applyAuthority(
+			s, 'c1',
+			{ tick: 3, hash: 'h3', resources: [pass(0, [{ charId: 'c1', seq: 1, tick: 3 }])], rounds: [], chars: charsAfter(1) },
+			[{ tick: 3, sessionId: 's1', charId: 'c1', seq: 1, cmd: 'claim', resource: 'pass', accepted: true, x: 1, y: 1, derived: true, roundId: 'pass-r1' }],
+			cfg,
+		);
+		expect(s.adjudicating).toHaveLength(0);
+		expect(s.rejectedInputs).toHaveLength(0);
+		expect(s.resources[0].holders[0].charId).toBe('c1');
+	});
+
+	it('defers a dependent move until the verdict, then executes it', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg, { resource: 'pass' });
+		s = applyLocalInput(s, 'c1', 2, 'right', cfg, { dependsOn: 1 });
+		s = applyAuthority(
+			s, 'c1',
+			{ tick: 1, hash: 'h1', resources: [pass(1)], rounds: [round()], chars: charsAfter(1) },
+			[{ tick: 1, sessionId: 's1', charId: 'c1', seq: 1, cmd: 'claim', resource: 'pass', accepted: false, x: 1, y: 1, collected: true, roundId: 'pass-r1' }],
+			cfg,
+		);
+		s = applyAuthority(
+			s, 'c1',
+			{ tick: 2, hash: 'h2', resources: [pass(1)], rounds: [round()], chars: charsAfter(2) },
+			[{ tick: 2, sessionId: 's1', charId: 'c1', seq: 2, cmd: 'right', dependsOn: 1, accepted: false, x: 1, y: 1, deferred: true, roundId: 'pass-r1' }],
+			cfg,
+		);
+		expect(s.adjudicating.map((p) => p.seq)).toEqual([1, 2]);
+		expect(s.rejectedInputs).toHaveLength(0);
+		// The deferred move's prediction stays visible while waiting.
+		expect([s.predX, s.predY]).toEqual([2, 1]);
+		s = applyAuthority(
+			s, 'c1',
+			{
+				tick: 3, hash: 'h3',
+				resources: [pass(0, [{ charId: 'c1', seq: 1, tick: 3 }])],
+				rounds: [],
+				chars: [
+					{ id: 'c1', x: 2, y: 1, facing: 'right', appliedSeq: 2 },
+					{ id: 'c2', x: 4, y: 1, facing: 'left', appliedSeq: 0 },
+				],
+			},
+			[
+				{ tick: 3, sessionId: 's1', charId: 'c1', seq: 1, cmd: 'claim', resource: 'pass', accepted: true, x: 1, y: 1, derived: true, roundId: 'pass-r1' },
+				{ tick: 3, sessionId: 's1', charId: 'c1', seq: 2, cmd: 'right', dependsOn: 1, accepted: true, x: 2, y: 1, derived: true, roundId: 'pass-r1' },
+			],
+			cfg,
+		);
+		expect(s.adjudicating).toHaveLength(0);
+		expect(s.rejectedInputs).toHaveLength(0);
+		expect([s.predX, s.predY]).toEqual([2, 1]);
+	});
+
+	it('settles an adjudicating claim whose verdict was missed offline', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg, { resource: 'pass' });
+		s = applyAuthority(
+			s, 'c1',
+			{ tick: 1, hash: 'h1', resources: [pass(1)], rounds: [round()], chars: charsAfter(1) },
+			[{ tick: 1, sessionId: 's1', charId: 'c1', seq: 1, cmd: 'claim', resource: 'pass', accepted: false, x: 1, y: 1, collected: true, roundId: 'pass-r1' }],
+			cfg,
+		);
+		// Room restarted; the verdict tick is gone. The round no longer
+		// exists and the holder is the other client.
+		s = applyAuthority(
+			s, 'c1',
+			{ tick: 9, hash: 'h9', resources: [pass(0, [{ charId: 'c2', seq: 1, tick: 3 }])], rounds: [], chars: charsAfter(1) },
+			[],
+			cfg,
+		);
+		expect(s.adjudicating).toHaveLength(0);
+		expect(s.rejectedInputs).toHaveLength(1);
+		expect(s.rejectedInputs[0].reason).toBe('settled-offline');
+	});
+});

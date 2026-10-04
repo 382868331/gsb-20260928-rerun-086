@@ -84,7 +84,9 @@ func (m *Manager) tickLoop(ri *RoomInstance) {
 			ri.mu.Unlock()
 			return
 		}
-		hasPending := len(ri.pending) > 0
+		// Open contention rounds keep the clock advancing: the collection
+		// boundary and any postponements are themselves ticked events.
+		hasPending := len(ri.pending) > 0 || ri.eng.HasOpenRound()
 		if hasPending {
 			ri.lastActive = time.Now()
 		}
@@ -173,6 +175,13 @@ func (m *Manager) LoadRoom(id string) error {
 				return err
 			}
 			queued = append(queued, e.Input)
+		case "round":
+			var e game.RoundEvent
+			if err := json.Unmarshal(line, &e); err != nil {
+				return err
+			}
+			rev := e
+			events = append(events, game.JournalEvent{Round: &rev})
 		}
 		return nil
 	})

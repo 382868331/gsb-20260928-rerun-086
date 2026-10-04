@@ -6,6 +6,7 @@ package platform
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -212,7 +213,17 @@ func (ri *RoomInstance) runTick() {
 	for _, in := range batch {
 		ri.markSeenLocked(in.CharID, in.Seq)
 	}
-	applied, snap := ri.eng.ApplyTick(batch)
+	// A contention round whose collection boundary falls on the next tick
+	// must wait when a client's claim is known but stuck behind a missing
+	// earlier input: the round cannot close honestly without it. The wait
+	// is journaled before the tick so replay re-derives the same boundary.
+	postpones, waitEvents := ri.computePostponementsLocked()
+	for _, we := range waitEvents {
+		if err := ri.journal.Append(we); err != nil {
+			panic(fmt.Errorf("room %s round-wait journal append: %w", ri.ID, err))
+		}
+	}
+	applied, snap := ri.eng.ApplyTickCtx(batch, postpones)
 	if applied == nil {
 		applied = []game.AppliedInput{}
 	}
@@ -231,6 +242,18 @@ func (ri *RoomInstance) runTick() {
 	}
 	jentry.Type = "tick"
 	err := ri.journal.Append(jentry)
+	for _, rev := range ri.eng.DrainRoundEvents() {
+		if rev.State == "closed" {
+			// Claims still stuck behind a gap when the round closed are
+			// explicitly cancelled — named in the journal, never silently
+			// dropped. If they arrive later they join a fresh round and
+			// receive their own explicit verdict.
+			rev.Cancelled = ri.stuckClaimsLocked(rev.Resource)
+		}
+		if err2 := ri.journal.Append(rev); err2 != nil && err == nil {
+			err = err2
+		}
+	}
 	ri.publishLocked(pubMsg{id: ri.nextEvtID, tick: snap.Tick, payload: payload})
 	ri.nextEvtID++
 	ri.mu.Unlock()
@@ -239,6 +262,57 @@ func (ri *RoomInstance) runTick() {
 		// honestly claim an event log afterwards.
 		panic(fmt.Errorf("room %s journal append: %w", ri.ID, err))
 	}
+}
+
+// computePostponementsLocked decides which rounds cannot close at the
+// next tick because a client's claim is stuck in the gap buffer (an
+// earlier input of that client has not arrived). Returns the postponement
+// map for the engine and the "waiting" round events to journal.
+func (ri *RoomInstance) computePostponementsLocked() (map[string]string, []game.RoundEvent) {
+	var postpones map[string]string
+	var events []game.RoundEvent
+	for _, rs := range ri.eng.OpenRounds() {
+		if rs.CloseTick != ri.eng.Tick+1 || rs.Postponements >= game.MaxRoundPostponements {
+			continue
+		}
+		for _, ch := range ri.Chars {
+			for _, in := range ri.waiting[ch.ID] {
+				if in.Cmd != game.CmdClaim || in.Resource != rs.Resource {
+					continue
+				}
+				reason := fmt.Sprintf("等待角色 %s 补齐 seq %d 之前的缺失输入", ch.ID, ri.nextExpectedLocked(ch.ID))
+				if postpones == nil {
+					postpones = map[string]string{}
+				}
+				postpones[rs.Resource] = reason
+				events = append(events, game.RoundEvent{
+					Type: "round", RoundID: rs.ID, Resource: rs.Resource, State: "waiting",
+					Tick: ri.eng.Tick + 1, OpenTick: rs.OpenTick,
+					CloseTick: rs.CloseTick + game.RoundWaitExtend, Reason: reason,
+				})
+			}
+		}
+	}
+	return postpones, events
+}
+
+// stuckClaimsLocked lists claims for a resource that are still stuck in
+// the gap buffer (character declaration order, then seq).
+func (ri *RoomInstance) stuckClaimsLocked(resource string) []game.Claimant {
+	var out []game.Claimant
+	for _, ch := range ri.Chars {
+		var seqs []int64
+		for _, in := range ri.waiting[ch.ID] {
+			if in.Cmd == game.CmdClaim && in.Resource == resource {
+				seqs = append(seqs, in.Seq)
+			}
+		}
+		sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+		for _, seq := range seqs {
+			out = append(out, game.Claimant{CharID: ch.ID, Seq: seq})
+		}
+	}
+	return out
 }
 
 const ringCapacity = 512

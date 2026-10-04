@@ -172,6 +172,14 @@ export async function createRoom(): Promise<RoomInfo> {
 	return (await resp.json()) as RoomInfo;
 }
 
+// resumeRoom reattaches to an existing room (after a page refresh or a
+// server restart); the server reloads it from its journal if needed.
+export async function resumeRoom(roomId: string): Promise<RoomInfo> {
+	const resp = await fetch(`/api/rooms/${roomId}`);
+	if (!resp.ok) throw new Error(`resume room failed: ${resp.status}`);
+	return (await resp.json()) as RoomInfo;
+}
+
 export async function runReplay(roomId: string): Promise<ReplayResult> {
 	const resp = await fetch(`/api/rooms/${roomId}/replay`, { method: 'POST' });
 	if (!resp.ok) throw new Error(`replay failed: ${resp.status}`);

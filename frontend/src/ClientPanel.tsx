@@ -186,6 +186,9 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 			<span>规则版本: <b>v{view.rules.version}</b></span>
 			<span>能量: <b>{me?.energy ?? 0}</b></span>
 			<span>待确认: <b className={predicting ? 'warn' : ''}>{view.pending.length}</b></span>
+			{view.adjudicating.length > 0 && (
+				<span>裁决中: <b className="warn">{view.adjudicating.length}</b></span>
+			)}
 		</div>
 		<div className="hash mono small">snapshot hash: {view.hash.slice(0, 20) || '…'}</div>
 
@@ -198,6 +201,41 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 					</li>
 				))}
 			</ul>
+		)}
+		{view.adjudicating.length > 0 && (
+			<ul className="pending-list adjudicating-list">
+				{view.adjudicating.map((p) => (
+					<li key={p.seq}>
+						seq {p.seq} {p.cmd} → {p.msg ?? `裁决中（轮次 ${p.roundId}）`} · 依据规则 v{p.ruleVersion}
+					</li>
+				))}
+			</ul>
+		)}
+		{view.rounds.length > 0 && (
+			<div className="resources rounds">
+				{view.rounds.map((rd) => {
+					const spec = room.resources.find((r) => r.id === rd.resource);
+					return (
+						<div key={rd.id} className="resource-line">
+							裁决轮次 <b>{rd.id}</b>（{spec?.name ?? rd.resource}）：
+							{rd.state === 'waiting'
+								? `等待中：${rd.reason ?? '缺少客户端输入'}（第 ${rd.postponements ?? 0} 次顺延，边界 tick ${rd.closeTick}）`
+								: `收集中，收集边界 tick ${rd.closeTick}`}
+							{rd.claimants.length > 0 && (
+								<span>
+									，已收集{' '}
+									{rd.claimants
+										.map((h) => {
+											const meta = room.chars.find((c) => c.id === h.charId);
+											return `${meta?.name ?? h.charId}（seq ${h.seq}）`;
+										})
+										.join('、')}
+								</span>
+							)}
+						</div>
+					);
+				})}
+			</div>
 		)}
 
 		<div className="dpad">
@@ -225,7 +263,9 @@ export function ClientPanel({ room, sessionIndex, chaos, duplicateSeen }: Props)
 		{view.resources.length > 0 && (
 			<div className="resources">
 				{view.resources.map((r) => {
-					const myPendingClaim = view.pending.some((p) => p.cmd === 'claim' && p.resource === r.id);
+				const myPendingClaim =
+					view.pending.some((p) => p.cmd === 'claim' && p.resource === r.id) ||
+					view.adjudicating.some((p) => p.cmd === 'claim' && p.resource === r.id);
 					return (
 						<div key={r.id} className="resource-line">
 							<b>{r.name}</b>：剩余 {r.remaining}/{r.total}

@@ -1,4 +1,4 @@
-import type { AppliedInput, CharState, Command, PendingInput, RejectedInput, ResourceState, Rules, Snapshot } from './types';
+import type { AppliedInput, CharState, Command, PendingInput, RejectedInput, ResourceState, RoundState, Rules, Snapshot } from './types';
 import { step, type PredConfig } from './predict';
 
 export interface ClientViewState {
@@ -12,6 +12,10 @@ export interface ClientViewState {
 	resources: ResourceState[];
 	// local pending inputs (predicted, not yet confirmed)
 	pending: PendingInput[];
+	// inputs collected into a contention round, awaiting its verdict
+	adjudicating: PendingInput[];
+	// open contention rounds (persistent identity + collection boundary)
+	rounds: RoundState[];
 	// predicted position of the locally owned character (last unacked layer)
 	predX: number;
 	predY: number;
@@ -32,6 +36,8 @@ export function initialView(
 		rules: rules ?? { version: 1, costs: {} },
 		resources: resources ?? [],
 		pending: [],
+		adjudicating: [],
+		rounds: [],
 		predX: initialAuth[0]?.x ?? 0,
 		predY: initialAuth[0]?.y ?? 0,
 		predFacing: initialAuth[0]?.facing ?? 'right',
@@ -96,10 +102,12 @@ export function applyAuthority(
 	if (!me || snap.tick < state.tick) return state;
 	const nextRules = rules ?? state.rules;
 	const nextResources = snap.resources ?? state.resources;
+	const nextRounds = snap.rounds ?? state.rounds;
 	const effCfg = { ...cfg, sealed: nextRules.sealed };
 	// Any pending input at or below the authority's ack is finished (confirmed
 	// or executed-but-blocked). Only still-in-flight seqs are re-predicted.
 	const stillPending = state.pending.filter((p) => p.seq > me.appliedSeq);
+	const adjudicating = [...state.adjudicating];
 	const mine = applied.filter((a) => a.charId === charId);
 	const settled = new Map(mine.map((a) => [a.seq, a]));
 	const rejectedInputs = [...state.rejectedInputs];
@@ -109,6 +117,45 @@ export function applyAuthority(
 	let authorityTailX = previousMe?.x ?? me.x;
 	let authorityTailY = previousMe?.y ?? me.y;
 	for (const rec of mine) {
+		if (rec.collected || rec.deferred) {
+			// The input joined a contention round: undecided, so it must
+			// not surface as a success (or a rejection) yet.
+			const p = pendingBySeq.get(rec.seq);
+			if (p) {
+				adjudicating.push({
+					...p,
+					status: 'adjudicating',
+					roundId: rec.roundId,
+					msg: rec.collected
+						? `已收集进裁决轮次 ${rec.roundId}，等待收集边界结算`
+						: `前置动作仍在轮次 ${rec.roundId} 中裁决，本动作顺延等待`,
+				});
+			}
+			continue;
+		}
+		if (rec.derived && rec.roundId) {
+			// A round verdict (or deferred execution) for an input we are
+			// tracking in the adjudicating list.
+			const idx = adjudicating.findIndex((a) => a.seq === rec.seq);
+			const p = idx >= 0 ? adjudicating[idx] : pendingBySeq.get(rec.seq);
+			if (idx >= 0) adjudicating.splice(idx, 1);
+			if (!p) continue;
+			if (!rec.accepted) {
+				const reason = rec.reason ?? 'blocked';
+				const target = p.cmd === 'claim' ? `「${p.resource ?? ''}」` : '';
+				rejectedInputs.push({
+					...p,
+					status: 'rejected',
+					finalX: rec.x,
+					finalY: rec.y,
+					reason,
+					appliedRuleVersion: rec.appliedRuleVersion,
+					needsReconfirm: rec.needsReconfirm,
+					msg: `轮次 ${rec.roundId} 裁决：依据 v${p.ruleVersion} 预测${target ? `取得${target}` : ''}，权威按 v${rec.appliedRuleVersion ?? p.ruleVersion} 判定${reasonLabel(reason)}`,
+				});
+			}
+			continue;
+		}
 		const p = pendingBySeq.get(rec.seq);
 		if (!p) continue;
 		const others = chars.filter((c) => c.id !== charId).map((c) => ({ x: c.x, y: c.y }));
@@ -142,10 +189,36 @@ export function applyAuthority(
 			correction = { fromX: p.predX, fromY: p.predY, toX: authorityTailX, toY: authorityTailY, at: Date.now() };
 		}
 	}
+	// Missed-verdict settle: a round we were waiting on is gone (e.g. the
+	// verdict was emitted while this client was offline and the room has
+	// since restarted). Settle from the authoritative resource holders
+	// instead of leaving the input undecided forever.
+	const openRoundIds = new Set(nextRounds.map((r) => r.id));
+	for (let i = adjudicating.length - 1; i >= 0; i--) {
+		const a = adjudicating[i];
+		if (!a.roundId || openRoundIds.has(a.roundId)) continue;
+		adjudicating.splice(i, 1);
+		if (a.cmd !== 'claim') continue;
+		const res = nextResources.find((r) => r.id === a.resource);
+		const granted = res?.holders.some((h) => h.charId === charId && h.seq === a.seq) ?? false;
+		if (!granted) {
+			rejectedInputs.push({
+				...a,
+				status: 'rejected',
+				finalX: me.x,
+				finalY: me.y,
+				reason: 'settled-offline',
+				msg: `轮次 ${a.roundId} 已在断线期间结算，未获得「${a.resource ?? ''}」（逐项依据见服务端日志）`,
+			});
+		}
+	}
 	let px = me.x;
 	let py = me.y;
 	let facing = me.facing;
-	for (const p of stillPending) {
+	// Re-predict the tail: in-flight inputs plus adjudicating ones (their
+	// movement prediction stays visible until the round verdict lands).
+	const tail = [...adjudicating, ...stillPending].sort((a, b) => a.seq - b.seq);
+	for (const p of tail) {
 		const others = chars.filter((c) => c.id !== charId).map((c) => ({ x: c.x, y: c.y }));
 		const n = step(px, py, p.cmd, others, effCfg);
 		px = n.x;
@@ -166,7 +239,9 @@ export function applyAuthority(
 		hash: snap.hash,
 		rules: nextRules,
 		resources: nextResources,
+		rounds: nextRounds,
 		pending: stillPending,
+		adjudicating,
 		predX: px,
 		predY: py,
 		predFacing: facing,
@@ -189,6 +264,8 @@ export function reasonLabel(reason: string): string {
 			return '拒绝（未知资源）';
 		case 'dependency-failed':
 			return '拒绝（依赖的前置动作未成功）';
+		case 'settled-offline':
+			return '拒绝（断线期间已结算，依据见服务端日志）';
 		default:
 			return '阻挡';
 	}
@@ -207,7 +284,9 @@ export function saveView(roomId: string, charId: string, state: ClientViewState,
 			hash: state.hash,
 			rules: state.rules,
 			resources: state.resources,
+			rounds: state.rounds,
 			pending: state.pending,
+			adjudicating: state.adjudicating,
 			predX: state.predX,
 			predY: state.predY,
 			predFacing: state.predFacing,
@@ -224,6 +303,8 @@ export function loadView(roomId: string, charId: string): { view: ClientViewStat
 		const parsed = JSON.parse(raw) as { nextSeq: number; view: ClientViewState };
 		if (!Array.isArray(parsed.view?.auth) || !Array.isArray(parsed.view?.pending)) return null;
 		parsed.view.rejectedInputs ??= [];
+		parsed.view.adjudicating ??= [];
+		parsed.view.rounds ??= [];
 		parsed.view.rules ??= { version: 1, costs: {} };
 		parsed.view.resources ??= [];
 		parsed.view.lastCorrection = null;

@@ -354,6 +354,13 @@ func ReplayFromDisk(dir, id string) (replayResponse, error) {
 			}
 			rec := e
 			events = append(events, game.JournalEvent{Rules: &rec})
+		case "round":
+			var e game.RoundEvent
+			if err := json.Unmarshal(line, &e); err != nil {
+				return err
+			}
+			rev := e
+			events = append(events, game.JournalEvent{Round: &rev})
 		}
 		return nil
 	})

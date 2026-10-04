@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { changeRules, createRoom, runReplay, type ChaosConfig, defaultChaos } from './api';
+import { changeRules, createRoom, resumeRoom, runReplay, type ChaosConfig, defaultChaos } from './api';
 import { ClientPanel } from './ClientPanel';
 import type { Command, ReplayResult, RoomInfo } from './types';
 
@@ -17,6 +17,11 @@ interface LogLine {
 	at: number;
 }
 
+// The room identity survives a page refresh so unconfirmed actions,
+// predictions and the adjudication queue can be checked against the same
+// authoritative room instead of silently starting a new one.
+const ROOM_KEY = 'gameplatform:roomId';
+
 export default function App() {
 	const [room, setRoom] = useState<RoomInfo | null>(null);
 	const [error, setError] = useState<string>('');
@@ -33,13 +38,45 @@ export default function App() {
 	}
 
 	useEffect(() => {
-		createRoom()
-			.then((info) => {
-				setRoom(info);
-				pushLog(`房间已创建：${info.roomId}（两个角色、两个会话）`, 'ok');
-			})
-			.catch((e) => setError(`无法连接 Go 权威服务：${String(e)}`));
+		let cancelled = false;
+		async function boot() {
+			const saved = localStorage.getItem(ROOM_KEY);
+			if (saved) {
+				try {
+					const info = await resumeRoom(saved);
+					localStorage.setItem(ROOM_KEY, info.roomId);
+					if (!cancelled) {
+						setRoom(info);
+						pushLog(`已恢复原房间与会话：${info.roomId}（继续核对旧预测、待确认队列与裁决轮次）`, 'ok');
+					}
+					return;
+				} catch {
+					// Room is gone (e.g. data dir wiped): fall through to a
+					// fresh room instead of getting stuck.
+					localStorage.removeItem(ROOM_KEY);
+				}
+			}
+			try {
+				const info = await createRoom();
+				localStorage.setItem(ROOM_KEY, info.roomId);
+				if (!cancelled) {
+					setRoom(info);
+					pushLog(`房间已创建：${info.roomId}（两个角色、两个会话）`, 'ok');
+				}
+			} catch (e) {
+				if (!cancelled) setError(`无法连接 Go 权威服务：${String(e)}`);
+			}
+		}
+		void boot();
+		return () => {
+			cancelled = true;
+		};
 	}, []);
+
+	function startNewRoom() {
+		localStorage.removeItem(ROOM_KEY);
+		location.reload();
+	}
 
 	useEffect(() => {
 		if (!autoReplay || !room) return;
@@ -84,6 +121,9 @@ export default function App() {
 			<header className="topbar">
 				<h1>游戏服务研发平台 · 虚拟角色状态同步</h1>
 				<div className="room mono small">room {room.roomId}</div>
+				<button onClick={startNewRoom} title="放弃当前房间并新建（旧房间的本地记录保留在其 roomId 下）">
+					新建房间
+				</button>
 			</header>
 
 			<section className="controls">
@@ -139,8 +179,8 @@ export default function App() {
 		)}
 
 			<section className="panels">
-				<ClientPanel room={room} sessionIndex={0} chaos={chaos} duplicateSeen={(t) => pushLog(t, 'warn')} />
-				<ClientPanel room={room} sessionIndex={1} chaos={chaos} duplicateSeen={(t) => pushLog(t, 'warn')} />
+				<ClientPanel key={`${room.roomId}:0`} room={room} sessionIndex={0} chaos={chaos} duplicateSeen={(t) => pushLog(t, 'warn')} />
+				<ClientPanel key={`${room.roomId}:1`} room={room} sessionIndex={1} chaos={chaos} duplicateSeen={(t) => pushLog(t, 'warn')} />
 			</section>
 
 			<section className="journal">

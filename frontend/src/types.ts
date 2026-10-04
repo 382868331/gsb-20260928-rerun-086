@@ -21,6 +21,19 @@ export interface ResourceState {
 	holders: Holder[];
 }
 
+// RoundState is the authoritative view of an open contention round: a
+// persistent adjudication identity with an explicit collection boundary.
+export interface RoundState {
+	id: string;
+	resource: string;
+	state: 'collecting' | 'waiting';
+	openTick: number;
+	closeTick: number;
+	reason?: string;
+	postponements?: number;
+	claimants: Holder[];
+}
+
 export interface CharMeta {
 	id: string;
 	name: string;
@@ -64,6 +77,7 @@ export interface Snapshot {
 	tick: number;
 	chars: CharState[];
 	resources?: ResourceState[];
+	rounds?: RoundState[];
 	hash: string;
 }
 
@@ -81,6 +95,12 @@ export interface AppliedInput {
 	// Basis declared by the client vs. version the authority applied.
 	ruleVersion?: number;
 	appliedRuleVersion?: number;
+	// Collected/deferred: the input joined a contention round and is not
+	// decided yet. Derived + roundId: a round verdict/execution record.
+	collected?: boolean;
+	deferred?: boolean;
+	derived?: boolean;
+	roundId?: string;
 	reason?:
 		| 'blocked'
 		| 'sealed'
@@ -122,11 +142,13 @@ export interface PendingInput {
 	resource?: string;
 	dependsOn?: number;
 	sentAt: number;
-	status: 'predicting' | 'confirmed' | 'rejected' | 'duplicate' | 'forbidden' | 'error';
+	status: 'predicting' | 'adjudicating' | 'confirmed' | 'rejected' | 'duplicate' | 'forbidden' | 'error';
 	predX: number;
 	predY: number;
 	// Rules version this input was formed under; never rewritten locally.
 	ruleVersion: number;
+	// Contention round this input was collected/deferred into.
+	roundId?: string;
 	msg?: string;
 }
 
