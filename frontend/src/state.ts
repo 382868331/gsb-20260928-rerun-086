@@ -102,7 +102,10 @@ export function applyAuthority(
 	if (!me || snap.tick < state.tick) return state;
 	const nextRules = rules ?? state.rules;
 	const nextResources = snap.resources ?? state.resources;
-	const nextRounds = snap.rounds ?? state.rounds;
+	// The snapshot is the single authoritative record for contention
+	// rounds: a round that no longer appears has been adjudicated and
+	// must not keep showing as still collecting.
+	const nextRounds = snap.rounds ?? [];
 	const effCfg = { ...cfg, sealed: nextRules.sealed };
 	// Any pending input at or below the authority's ack is finished (confirmed
 	// or executed-but-blocked). Only still-in-flight seqs are re-predicted.

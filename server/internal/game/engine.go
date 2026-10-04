@@ -239,7 +239,7 @@ type Snapshot struct {
 	Tick      int64           `json:"tick"`
 	Chars     []CharState     `json:"chars"`
 	Resources []ResourceState `json:"resources,omitempty"`
-	Rounds    []RoundState    `json:"rounds,omitempty"`
+	Rounds    []RoundState    `json:"rounds"`
 	Hash      string          `json:"hash"`
 }
 
@@ -707,7 +707,7 @@ func (r *Room) isSealed(x, y int) bool {
 func (r *Room) Passable(x, y int, moverID string) bool { return r.passable(x, y, moverID) }
 
 func (r *Room) Snapshot() Snapshot {
-	s := Snapshot{Tick: r.Tick, Chars: make([]CharState, 0, len(r.Chars))}
+	s := Snapshot{Tick: r.Tick, Chars: make([]CharState, 0, len(r.Chars)), Rounds: make([]RoundState, 0)}
 	for _, c := range r.Chars {
 		s.Chars = append(s.Chars, CharState{
 			ID: c.ID, X: c.X, Y: c.Y, Facing: c.Facing, Energy: c.Energy, AppliedSeq: c.AppliedSeq,

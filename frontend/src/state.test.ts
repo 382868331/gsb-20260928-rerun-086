@@ -455,4 +455,30 @@ describe('contention rounds', () => {
 		expect(s.rejectedInputs).toHaveLength(1);
 		expect(s.rejectedInputs[0].reason).toBe('settled-offline');
 	});
+
+	it('clears a closed round even when the verdict snapshot omits the rounds key', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg, { resource: 'pass' });
+		s = applyAuthority(
+			s, 'c1',
+			{ tick: 1, hash: 'h1', resources: [pass(1)], rounds: [round()], chars: charsAfter(1) },
+			[{ tick: 1, sessionId: 's1', charId: 'c1', seq: 1, cmd: 'claim', resource: 'pass', accepted: false, x: 1, y: 1, collected: true, roundId: 'pass-r1' }],
+			cfg,
+		);
+		expect(s.rounds).toHaveLength(1);
+		// The authoritative record for the verdict tick carries no rounds
+		// key at all: the adjudicated round must not linger as collecting.
+		const verdictSnap = {
+			tick: 3, hash: 'h3',
+			resources: [pass(0, [{ charId: 'c2', seq: 1, tick: 3 }])],
+			chars: charsAfter(1),
+		} as Snapshot;
+		const verdict: AppliedInput = {
+			tick: 3, sessionId: 's1', charId: 'c1', seq: 1, cmd: 'claim', resource: 'pass',
+			accepted: false, x: 1, y: 1, derived: true, roundId: 'pass-r1', reason: 'resource-exhausted',
+		};
+		s = applyAuthority(s, 'c1', verdictSnap, [verdict], cfg);
+		expect(s.rounds).toHaveLength(0);
+		expect(s.rejectedInputs).toHaveLength(1);
+		expect(s.rejectedInputs[0].reason).toBe('resource-exhausted');
+	});
 });
