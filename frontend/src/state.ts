@@ -102,7 +102,10 @@ export function applyAuthority(
 	if (!me || snap.tick < state.tick) return state;
 	const nextRules = rules ?? state.rules;
 	const nextResources = snap.resources ?? state.resources;
-	const nextRounds = snap.rounds ?? state.rounds;
+	// Rounds come solely from the authoritative snapshot: the server omits
+	// the field once every round has closed, so a missing field means "no
+	// open round" — never keep a stale, already-adjudicated round on screen.
+	const nextRounds = snap.rounds ?? [];
 	const effCfg = { ...cfg, sealed: nextRules.sealed };
 	// Any pending input at or below the authority's ack is finished (confirmed
 	// or executed-but-blocked). Only still-in-flight seqs are re-predicted.

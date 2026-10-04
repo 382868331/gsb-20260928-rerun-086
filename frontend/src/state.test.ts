@@ -455,4 +455,58 @@ describe('contention rounds', () => {
 		expect(s.rejectedInputs).toHaveLength(1);
 		expect(s.rejectedInputs[0].reason).toBe('settled-offline');
 	});
+
+	it('drops a closed round when the server omits the rounds field', () => {
+		// The server omits "rounds" entirely once every round has closed
+		// (omitempty). The verdict snapshot below is exactly what the wire
+		// carries: a rejection record and NO rounds key. The round must not
+		// linger as "collecting" next to its own verdict.
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg, { resource: 'pass' });
+		s = applyAuthority(
+			s, 'c1',
+			{ tick: 1, hash: 'h1', resources: [pass(1)], rounds: [round()], chars: charsAfter(1) },
+			[{ tick: 1, sessionId: 's1', charId: 'c1', seq: 1, cmd: 'claim', resource: 'pass', accepted: false, x: 1, y: 1, collected: true, roundId: 'pass-r1' }],
+			cfg,
+		);
+		expect(s.rounds).toHaveLength(1);
+		const verdictSnap = {
+			tick: 3, hash: 'h3',
+			resources: [pass(0, [{ charId: 'c2', seq: 1, tick: 3 }])],
+			chars: charsAfter(1),
+		} as unknown as Snapshot;
+		const verdict: AppliedInput = {
+			tick: 3, sessionId: 's1', charId: 'c1', seq: 1, cmd: 'claim', resource: 'pass',
+			accepted: false, x: 1, y: 1, derived: true, roundId: 'pass-r1', reason: 'resource-exhausted',
+		};
+		s = applyAuthority(s, 'c1', verdictSnap, [verdict], cfg);
+		expect(s.rounds).toHaveLength(0);
+		expect(s.adjudicating).toHaveLength(0);
+		expect(s.rejectedInputs).toHaveLength(1);
+		expect(s.rejectedInputs[0].reason).toBe('resource-exhausted');
+		// Later heartbeats also carry no rounds key; the closed round must
+		// not reappear.
+		s = applyAuthority(s, 'c1', { ...verdictSnap, tick: 4, hash: 'h4' }, [], cfg);
+		expect(s.rounds).toHaveLength(0);
+	});
+
+	it('settles an adjudicating claim whose verdict was missed offline', () => {
+		let s = applyLocalInput(start(), 'c1', 1, 'claim', cfg, { resource: 'pass' });
+		s = applyAuthority(
+			s, 'c1',
+			{ tick: 1, hash: 'h1', resources: [pass(1)], rounds: [round()], chars: charsAfter(1) },
+			[{ tick: 1, sessionId: 's1', charId: 'c1', seq: 1, cmd: 'claim', resource: 'pass', accepted: false, x: 1, y: 1, collected: true, roundId: 'pass-r1' }],
+			cfg,
+		);
+		// Room restarted; the verdict tick is gone. The round no longer
+		// exists and the holder is the other client.
+		s = applyAuthority(
+			s, 'c1',
+			{ tick: 9, hash: 'h9', resources: [pass(0, [{ charId: 'c2', seq: 1, tick: 3 }])], rounds: [], chars: charsAfter(1) },
+			[],
+			cfg,
+		);
+		expect(s.adjudicating).toHaveLength(0);
+		expect(s.rejectedInputs).toHaveLength(1);
+		expect(s.rejectedInputs[0].reason).toBe('settled-offline');
+	});
 });
