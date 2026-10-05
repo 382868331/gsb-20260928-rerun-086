@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { changeRules, createRoom, resumeRoom, runReplay, type ChaosConfig, defaultChaos } from './api';
 import { ClientPanel } from './ClientPanel';
+import { ReservationsPanel } from './ReservationsPanel';
 import type { Command, ReplayResult, RoomInfo } from './types';
 
 // Demo rule presets: seal a corridor and/or raise movement cost.
@@ -177,6 +178,9 @@ export default function App() {
 					<div className="verdict">{replay.match ? '✓ 重放结果与服务端实时结论完全一致' : `✗ 在 tick ${replay.divergedAt} 出现分歧`}</div>
 				</section>
 		)}
+
+			<ReservationsPanel room={room} log={pushLog} /
+>
 
 			<section className="panels">
 				<ClientPanel key={`${room.roomId}:0`} room={room} sessionIndex={0} chaos={chaos} duplicateSeen={(t) => pushLog(t, 'warn')} />

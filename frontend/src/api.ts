@@ -1,4 +1,4 @@
-import type { Command, EnqueueResult, ReplayResult, RoomInfo, Rules, SnapshotEvent } from './types';
+import type { Command, EnqueueResult, ReplayResult, ReservationResult, RoomInfo, Rules, Snapshot, SnapshotEvent } from './types';
 
 export interface ChaosConfig {
 	// Delay range (ms) applied to every POST before it leaves the client.
@@ -178,6 +178,36 @@ export async function resumeRoom(roomId: string): Promise<RoomInfo> {
 	const resp = await fetch(`/api/rooms/${roomId}`);
 	if (!resp.ok) throw new Error(`resume room failed: ${resp.status}`);
 	return (await resp.json()) as RoomInfo;
+}
+
+// fetchRoomSnapshot reads the current authoritative snapshot (used by the
+// reservation panel's lightweight polling view).
+export async function fetchRoomSnapshot(roomId: string): Promise<Snapshot> {
+	const resp = await fetch(`/api/rooms/${roomId}`);
+	if (!resp.ok) throw new Error(`get room failed: ${resp.status}`);
+	const info = (await resp.json()) as { snapshot: Snapshot };
+	return info.snapshot;
+}
+
+// submitReservation sends a group multi-region reservation. The
+// client-generated requestId makes retries and duplicate submissions
+// idempotent: the server returns the existing record unchanged.
+export async function submitReservation(
+	roomId: string,
+	body: { requestId: string; charIds: string[]; regions: string[]; start: number; end: number; priority: number },
+): Promise<{ status: number; result: ReservationResult }> {
+	const resp = await fetch(`/api/rooms/${roomId}/reservations`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(body),
+	});
+	return { status: resp.status, result: (await resp.json()) as ReservationResult };
+}
+
+export async function reservationOp(roomId: string, requestId: string, op: 'cancel' | 'release'): Promise<ReservationResult> {
+	const resp = await fetch(`/api/rooms/${roomId}/reservations/${requestId}/${op}`, { method: 'POST' });
+	if (!resp.ok) throw new Error(`${op} failed: ${resp.status}`);
+	return (await resp.json()) as ReservationResult;
 }
 
 export async function runReplay(roomId: string): Promise<ReplayResult> {

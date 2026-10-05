@@ -6,6 +6,36 @@ export interface ResourceSpec {
 	name: string;
 	total: number;
 }
+// Bookable region for group multi-region pass reservations.
+export interface RegionSpec {
+	id: string;
+	name: string;
+	capacity: number;
+}
+
+// One concrete interval blocking a reservation request.
+export interface ResvConflict {
+	kind: 'capacity' | 'char-overlap';
+	region?: string;
+	charId?: string;
+	from: number;
+	to: number;
+	with?: string;
+}
+
+// Authoritative view of one group reservation request.
+export interface ResvView {
+	id: string;
+	charIds: string[];
+	regions: string[];
+	start: number;
+	end: number;
+	priority: number;
+	boost: number;
+	submitTick: number;
+	phase: 'pending' | 'approved' | 'active' | 'completed' | 'released' | 'cancelled' | 'expired';
+	conflicts?: ResvConflict[];
+}
 
 export interface Holder {
 	charId: string;
@@ -49,7 +79,7 @@ export interface SessionInfo {
 
 export interface RoomInfo {
 	roomId: string;
-	config: { width: number; height: number; obstacles: [number, number][] };
+	config: { width: number; height: number; obstacles: [number, number][]; regions?: RegionSpec[] };
 	chars: CharMeta[];
 	sessions: SessionInfo[];
 	rules: Rules;
@@ -78,6 +108,7 @@ export interface Snapshot {
 	chars: CharState[];
 	resources?: ResourceState[];
 	rounds?: RoundState[];
+	reservations?: ResvView[];
 	hash: string;
 }
 
@@ -124,6 +155,11 @@ export interface EnqueueResult {
 	status: 'accepted' | 'stale' | 'forbidden';
 	appliedSeq: number;
 	ruleVersion?: number;
+}
+
+export interface ReservationResult {
+	status: string;
+	reservation: ResvView;
 }
 
 export interface ReplayResult {

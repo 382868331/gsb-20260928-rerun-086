@@ -181,3 +181,25 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 	gap: 4px;
 	font-size: 12px;
 }
+
+/* group multi-region reservations */
+.resv { margin: 12px 0; padding: 12px; border: 1px solid #334155; border-radius: 8px; }
+.resv h3 { margin: 0 0 8px; }
+.resv-form { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 10px; }
+.resv-regions { display: flex; gap: 16px; margin-bottom: 10px; }
+.resv-region { padding: 6px 10px; border: 1px solid #475569; border-radius: 6px; }
+.resv-bar { display: flex; gap: 4px; margin-top: 4px; }
+.resv-bar .slot { width: 18px; height: 10px; border-radius: 2px; background: #1e293b; border: 1px solid #475569; }
+.resv-bar .slot.used { background: #38bdf8; border-color: #38bdf8; }
+.resv-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.resv-table th, .resv-table td { border-bottom: 1px solid #334155; padding: 4px 6px; text-align: left; vertical-align: top; }
+.resv-table .conflict { color: #fbbf24; }
+.badge { padding: 1px 8px; border-radius: 10px; font-size: 12px; background: #334155; }
+.badge.phase-pending { background: #a16207; }
+.badge.phase-approved { background: #15803d; }
+.badge.phase-active { background: #0e7490; }
+.badge.phase-completed { background: #475569; }
+.badge.phase-released { background: #6d28d9; }
+.badge.phase-cancelled { background: #7f1d1d; }
+.badge.phase-expired { background: #9f1239; }
+tr.phase-expired td, tr.phase-cancelled td { opacity: 0.75; }

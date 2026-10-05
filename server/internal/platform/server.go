@@ -28,6 +28,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/rooms/{id}/rules", s.postRules)
 	mux.HandleFunc("GET /api/rooms/{id}/journal", s.journal)
 	mux.HandleFunc("POST /api/rooms/{id}/replay", s.replay)
+	mux.HandleFunc("POST /api/rooms/{id}/reservations", s.postReservation)
+	mux.HandleFunc("POST /api/rooms/{id}/reservations/{rid}/cancel", s.cancelReservation)
+	mux.HandleFunc("POST /api/rooms/{id}/reservations/{rid}/release", s.releaseReservation)
 	return withCommonHeaders(mux)
 }
 
@@ -121,6 +124,132 @@ func (s *Server) postRules(w http.ResponseWriter, r *http.Request) {
 	}
 	rules := ri.SwitchRules(req.Sealed, req.Costs, req.ClaimsClosed)
 	writeJSON(w, 200, rules)
+}
+
+type reservationRequest struct {
+	RequestID string   `json:"requestId"`
+	CharIDs   []string `json:"charIds"`
+	Regions   []string `json:"regions"`
+	Start     int64    `json:"start"`
+	End       int64    `json:"end"`
+	Priority  int      `json:"priority"`
+}
+
+type reservationResponse struct {
+	Status      string        `json:"status"` // created | duplicate
+	Reservation game.ResvView `json:"reservation"`
+}
+
+// postReservation submits a group multi-region pass reservation. The
+// client-generated requestId is the idempotency identity: reconnects and
+// duplicate submissions return the existing record unchanged.
+func (s *Server) postReservation(w http.ResponseWriter, r *http.Request) {
+	ri, err := s.roomOrLoad(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, 404, "room not found")
+		return
+	}
+	var req reservationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	if req.RequestID == "" {
+		writeErr(w, 400, "requestId is required")
+		return
+	}
+	if len(req.CharIDs) == 0 || len(req.Regions) == 0 {
+		writeErr(w, 400, "charIds and regions are required")
+		return
+	}
+	seenChar := map[string]bool{}
+	for _, c := range req.CharIDs {
+		if seenChar[c] {
+			writeErr(w, 400, "duplicate charId")
+			return
+		}
+		seenChar[c] = true
+		found := false
+		for _, ch := range ri.Chars {
+			if ch.ID == c {
+				found = true
+				break
+			}
+		}
+		if !found {
+			writeErr(w, 400, "unknown charId: "+c)
+			return
+		}
+	}
+	seenRegion := map[string]bool{}
+	for _, g := range req.Regions {
+		if seenRegion[g] {
+			writeErr(w, 400, "duplicate region")
+			return
+		}
+		seenRegion[g] = true
+		found := false
+		for _, spec := range ri.Cfg.Regions {
+			if spec.ID == g {
+				found = true
+				break
+			}
+		}
+		if !found {
+			writeErr(w, 400, "unknown region: "+g)
+			return
+		}
+	}
+	if req.End <= req.Start {
+		writeErr(w, 400, "end must be after start")
+		return
+	}
+	if req.Start <= ri.snapshot().Tick {
+		writeErr(w, 400, "start must be in the future")
+		return
+	}
+	if req.Priority < 0 || req.Priority > 10 {
+		writeErr(w, 400, "priority must be in [0,10]")
+		return
+	}
+	view, status := ri.submitReservation(game.ResvRequest{
+		ID: req.RequestID, CharIDs: req.CharIDs, Regions: req.Regions,
+		Start: req.Start, End: req.End, Priority: req.Priority,
+	})
+	code := 201
+	if status == "duplicate" {
+		// Idempotent acknowledgement of a retried submission.
+		code = 200
+	}
+	writeJSON(w, code, reservationResponse{Status: status, Reservation: view})
+}
+
+func (s *Server) reservationOp(w http.ResponseWriter, r *http.Request, op string) {
+	ri, err := s.roomOrLoad(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, 404, "room not found")
+		return
+	}
+	view, ok := ri.resvOp(op, r.PathValue("rid"))
+	if !ok {
+		writeErr(w, 404, "reservation not found")
+		return
+	}
+	writeJSON(w, 200, reservationResponse{Status: "ok", Reservation: view})
+}
+
+// cancelReservation withdraws a request before its window starts. A late
+// cancel (already started) is an explicit no-op: capacity stays with the
+// holders and later grantees are unaffected.
+func (s *Server) cancelReservation(w http.ResponseWriter, r *http.Request) {
+	s.reservationOp(w, r, "cancel")
+}
+
+// releaseReservation returns the remaining window of an active
+// reservation early, freeing capacity from now on. A duplicate release is
+// an idempotent no-op.
+func (s *Server) releaseReservation(w http.ResponseWriter, r *http.Request) {
+	s.reservationOp(w, r, "release")
 }
 
 func (s *Server) roomOrLoad(id string) (*RoomInstance, error) {
@@ -361,6 +490,27 @@ func ReplayFromDisk(dir, id string) (replayResponse, error) {
 			}
 			rev := e
 			events = append(events, game.JournalEvent{Round: &rev})
+		case "resvreq":
+			var e game.ResvRequest
+			if err := json.Unmarshal(line, &e); err != nil {
+				return err
+			}
+			req := e
+			events = append(events, game.JournalEvent{ResvReq: &req})
+		case "resvop":
+			var e game.ResvOpRecord
+			if err := json.Unmarshal(line, &e); err != nil {
+				return err
+			}
+			rec := e
+			events = append(events, game.JournalEvent{ResvOp: &rec})
+		case "resv":
+			var e game.ResvEvent
+			if err := json.Unmarshal(line, &e); err != nil {
+				return err
+			}
+			rev := e
+			events = append(events, game.JournalEvent{Resv: &rev})
 		}
 		return nil
 	})

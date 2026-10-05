@@ -86,7 +86,9 @@ func (m *Manager) tickLoop(ri *RoomInstance) {
 		}
 		// Open contention rounds keep the clock advancing: the collection
 		// boundary and any postponements are themselves ticked events.
-		hasPending := len(ri.pending) > 0 || ri.eng.HasOpenRound()
+		hasPending := len(ri.pending) > 0 || ri.eng.HasOpenRound() ||
+			len(ri.pendingResvReqs) > 0 || len(ri.pendingResvOps) > 0 ||
+			ri.eng.HasPendingReservations()
 		if hasPending {
 			ri.lastActive = time.Now()
 		}
@@ -182,6 +184,27 @@ func (m *Manager) LoadRoom(id string) error {
 			}
 			rev := e
 			events = append(events, game.JournalEvent{Round: &rev})
+		case "resvreq":
+			var e game.ResvRequest
+			if err := json.Unmarshal(line, &e); err != nil {
+				return err
+			}
+			req := e
+			events = append(events, game.JournalEvent{ResvReq: &req})
+		case "resvop":
+			var e game.ResvOpRecord
+			if err := json.Unmarshal(line, &e); err != nil {
+				return err
+			}
+			rec := e
+			events = append(events, game.JournalEvent{ResvOp: &rec})
+		case "resv":
+			var e game.ResvEvent
+			if err := json.Unmarshal(line, &e); err != nil {
+				return err
+			}
+			rev := e
+			events = append(events, game.JournalEvent{Resv: &rev})
 		}
 		return nil
 	})

@@ -62,20 +62,22 @@ type RoomInstance struct {
 	Views    []CharView
 	Sessions []SessionView
 
-	mu           sync.Mutex
-	eng          *game.Room
-	journal      *store.Journal
-	pending      []game.Input
-	pendingRules *game.Rules      // switched at the next tick boundary
-	admitted     map[string]int64 // charId -> highest seq seen by intake
-	seen         map[string]map[int64]struct{}
-	waiting      map[string]map[int64]game.Input
-	subs         map[int]chan pubMsg
-	nextSub      int
-	ring         []pubMsg // recent SSE payloads, absolute event ids
-	nextEvtID    int64
-	lastActive   time.Time
-	stopped      bool
+	mu              sync.Mutex
+	eng             *game.Room
+	journal         *store.Journal
+	pending         []game.Input
+	pendingRules    *game.Rules        // switched at the next tick boundary
+	pendingResvReqs []game.ResvRequest // journaled, fed at the next tick
+	pendingResvOps  []game.ResvOp      // journaled, applied at the next tick
+	admitted        map[string]int64   // charId -> highest seq seen by intake
+	seen            map[string]map[int64]struct{}
+	waiting         map[string]map[int64]game.Input
+	subs            map[int]chan pubMsg
+	nextSub         int
+	ring            []pubMsg // recent SSE payloads, absolute event ids
+	nextEvtID       int64
+	lastActive      time.Time
+	stopped         bool
 }
 
 // EnqueueResult is returned for every input POST.
@@ -210,6 +212,10 @@ func (ri *RoomInstance) runTick() {
 	}
 	batch := ri.pending
 	ri.pending = nil
+	resvReqs := ri.pendingResvReqs
+	ri.pendingResvReqs = nil
+	resvOps := ri.pendingResvOps
+	ri.pendingResvOps = nil
 	for _, in := range batch {
 		ri.markSeenLocked(in.CharID, in.Seq)
 	}
@@ -223,7 +229,7 @@ func (ri *RoomInstance) runTick() {
 			panic(fmt.Errorf("room %s round-wait journal append: %w", ri.ID, err))
 		}
 	}
-	applied, snap := ri.eng.ApplyTickCtx(batch, postpones)
+	applied, snap := ri.eng.ApplyTickExt(batch, postpones, resvReqs, resvOps)
 	if applied == nil {
 		applied = []game.AppliedInput{}
 	}
@@ -242,6 +248,11 @@ func (ri *RoomInstance) runTick() {
 	}
 	jentry.Type = "tick"
 	err := ri.journal.Append(jentry)
+	for _, rev := range ri.eng.DrainResvEvents() {
+		if err2 := ri.journal.Append(rev); err2 != nil && err == nil {
+			err = err2
+		}
+	}
 	for _, rev := range ri.eng.DrainRoundEvents() {
 		if rev.State == "closed" {
 			// Claims still stuck behind a gap when the round closed are
@@ -365,6 +376,70 @@ func (ri *RoomInstance) snapshot() game.Snapshot {
 	s := ri.eng.Snapshot()
 	s.Hash = s.HashValue()
 	return s
+}
+
+// reservationView returns the authoritative view of one reservation.
+func (ri *RoomInstance) reservationView(id string) (game.ResvView, bool) {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+	return ri.eng.ReservationView(id)
+}
+
+// rules returns the rules currently in force.
+// submitReservation registers a group reservation request. The request
+// identity is client-generated: a retried submission with the same id
+// returns the existing record instead of consuming capacity twice. New
+// requests are journaled first, then forced into the very next tick so
+// the adjudication result is durable and immediately visible.
+func (ri *RoomInstance) submitReservation(req game.ResvRequest) (game.ResvView, string) {
+	ri.mu.Lock()
+	if _, ok := ri.eng.GetReservation(req.ID); ok {
+		view, _ := ri.eng.ReservationView(req.ID)
+		ri.mu.Unlock()
+		return view, "duplicate"
+	}
+	for _, q := range ri.pendingResvReqs {
+		if q.ID == req.ID {
+			ri.mu.Unlock()
+			return game.ResvView{ID: req.ID, Phase: "pending"}, "duplicate"
+		}
+	}
+	req.Type = "resvreq"
+	if err := ri.journal.Append(req); err != nil {
+		panic(fmt.Errorf("room %s resvreq journal append: %w", ri.ID, err))
+	}
+	ri.pendingResvReqs = append(ri.pendingResvReqs, req)
+	ri.lastActive = time.Now()
+	ri.mu.Unlock()
+	ri.runTick()
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+	view, _ := ri.eng.ReservationView(req.ID)
+	return view, "created"
+}
+
+// resvOp journals a cancel/release op taking effect at the next tick and
+// forces that tick, mirroring the rule-switch path. Late cancels and
+// duplicate releases are explicit no-ops decided by the engine; the
+// resulting authoritative view is returned either way.
+func (ri *RoomInstance) resvOp(op, id string) (game.ResvView, bool) {
+	ri.mu.Lock()
+	if _, ok := ri.eng.GetReservation(id); !ok {
+		ri.mu.Unlock()
+		return game.ResvView{}, false
+	}
+	rec := game.ResvOpRecord{Type: "resvop", Tick: ri.eng.Tick + 1, Op: op, ID: id}
+	if err := ri.journal.Append(rec); err != nil {
+		panic(fmt.Errorf("room %s resvop journal append: %w", ri.ID, err))
+	}
+	ri.pendingResvOps = append(ri.pendingResvOps, game.ResvOp{Op: op, ID: id})
+	ri.lastActive = time.Now()
+	ri.mu.Unlock()
+	ri.runTick()
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+	view, _ := ri.eng.ReservationView(id)
+	return view, true
 }
 
 // rules returns the rules currently in force.
