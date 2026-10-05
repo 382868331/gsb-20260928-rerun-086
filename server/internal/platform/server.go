@@ -26,6 +26,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/rooms/{id}/events", s.events)
 	mux.HandleFunc("POST /api/rooms/{id}/inputs", s.postInput)
 	mux.HandleFunc("POST /api/rooms/{id}/rules", s.postRules)
+	mux.HandleFunc("POST /api/rooms/{id}/reservations", s.postReservation)
+	mux.HandleFunc("POST /api/rooms/{id}/reservations/{rid}/cancel", s.postReservationCancel)
+	mux.HandleFunc("POST /api/rooms/{id}/reservations/{rid}/return", s.postReservationReturn)
 	mux.HandleFunc("GET /api/rooms/{id}/journal", s.journal)
 	mux.HandleFunc("POST /api/rooms/{id}/replay", s.replay)
 	return withCommonHeaders(mux)
@@ -361,6 +364,13 @@ func ReplayFromDisk(dir, id string) (replayResponse, error) {
 			}
 			rev := e
 			events = append(events, game.JournalEvent{Round: &rev})
+		case "resv":
+			var e game.ResvEvent
+			if err := json.Unmarshal(line, &e); err != nil {
+				return err
+			}
+			rev := e
+			events = append(events, game.JournalEvent{Resv: &rev})
 		}
 		return nil
 	})
@@ -396,4 +406,140 @@ func ReplayFromDisk(dir, id string) (replayResponse, error) {
 		resp.LiveFinal = liveHashes[len(liveHashes)-1]
 	}
 	return resp, nil
+}
+
+type reservationRequest struct {
+	SessionID string   `json:"sessionId"`
+	RequestID string   `json:"requestId"`
+	Chars     []string `json:"chars"`
+	Regions   []string `json:"regions"`
+	Start     int64    `json:"start"`
+	End       int64    `json:"end"`
+	Priority  int      `json:"priority"`
+}
+
+// postReservation submits an idempotent multi-region group reservation.
+// The client-chosen requestId is the durable identity: retries after a
+// disconnect or plain double submissions return the existing request and
+// never consume capacity twice.
+func (s *Server) postReservation(w http.ResponseWriter, r *http.Request) {
+	ri, err := s.roomOrLoad(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, 404, "room not found")
+		return
+	}
+	var req reservationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	if !s.validSession(ri, req.SessionID) {
+		writeErr(w, 403, "unknown session")
+		return
+	}
+	if req.RequestID == "" {
+		writeErr(w, 400, "requestId is required")
+		return
+	}
+	if len(req.Chars) == 0 || len(req.Regions) == 0 {
+		writeErr(w, 400, "chars and regions are required")
+		return
+	}
+	if req.End <= req.Start || req.Start < 0 {
+		writeErr(w, 400, "invalid time window")
+		return
+	}
+	for _, ch := range req.Chars {
+		found := false
+		for _, v := range ri.Views {
+			if v.ID == ch {
+				found = true
+				break
+			}
+		}
+		if !found {
+			writeErr(w, 400, "unknown character "+ch)
+			return
+		}
+	}
+	for _, rg := range req.Regions {
+		found := false
+		for _, spec := range ri.Cfg.Regions {
+			if spec.ID == rg {
+				found = true
+				break
+			}
+		}
+		if !found {
+			writeErr(w, 400, "unknown region "+rg)
+			return
+		}
+	}
+	priority := req.Priority
+	if priority < 0 {
+		priority = 0
+	}
+	if priority > 10 {
+		priority = 10
+	}
+	res := ri.submitReservation(game.ReservationRequest{
+		ID: req.RequestID, Chars: req.Chars, Regions: req.Regions,
+		Start: req.Start, End: req.End, Priority: priority,
+	})
+	code := 202
+	if res.Status == "duplicate" {
+		// Idempotent acknowledgement: the original request identity and
+		// its (possibly already closed) verdict are preserved.
+		code = 200
+	}
+	writeJSON(w, code, res)
+}
+
+type reservationOpRequest struct {
+	SessionID string `json:"sessionId"`
+}
+
+// postReservationCancel withdraws a request before it starts. A cancel
+// that lands after the start is an explicit no-op verdict and cannot
+// affect reservations that were granted later.
+func (s *Server) postReservationCancel(w http.ResponseWriter, r *http.Request) {
+	s.reservationOp(w, r, "cancel")
+}
+
+// postReservationReturn releases the remaining window of an active
+// reservation early. Duplicate returns are idempotent no-ops.
+func (s *Server) postReservationReturn(w http.ResponseWriter, r *http.Request) {
+	s.reservationOp(w, r, "return")
+}
+
+func (s *Server) reservationOp(w http.ResponseWriter, r *http.Request, op string) {
+	ri, err := s.roomOrLoad(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, 404, "room not found")
+		return
+	}
+	var req reservationOpRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, 400, "invalid json: "+err.Error())
+		return
+	}
+	if !s.validSession(ri, req.SessionID) {
+		writeErr(w, 403, "unknown session")
+		return
+	}
+	view, ok := ri.reservationOp(op, r.PathValue("rid"))
+	if !ok {
+		writeErr(w, 404, "reservation not found")
+		return
+	}
+	writeJSON(w, 202, map[string]interface{}{"status": "accepted", "reservation": view})
+}
+
+func (s *Server) validSession(ri *RoomInstance, sessionID string) bool {
+	for _, sv := range ri.Sessions {
+		if sv.ID == sessionID {
+			return true
+		}
+	}
+	return false
 }

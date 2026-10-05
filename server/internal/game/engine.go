@@ -224,6 +224,8 @@ type Config struct {
 	Obstacles [][2]int `json:"obstacles"`
 	// Resources are the shared finite resources clients contend for.
 	Resources []ResourceSpec `json:"resources,omitempty"`
+	// Regions are the bookable areas group reservations contend for.
+	Regions []RegionSpec `json:"regions,omitempty"`
 }
 
 type CharState struct {
@@ -240,7 +242,11 @@ type Snapshot struct {
 	Chars     []CharState     `json:"chars"`
 	Resources []ResourceState `json:"resources,omitempty"`
 	Rounds    []RoundState    `json:"rounds"`
-	Hash      string          `json:"hash"`
+	// Regions and Reservations expose the group-reservation subsystem:
+	// per-region live occupancy and every request's overall phase.
+	Regions      []RegionView      `json:"regions,omitempty"`
+	Reservations []ReservationView `json:"reservations,omitempty"`
+	Hash         string            `json:"hash"`
 }
 
 // AppliedInput records that an input was processed at a specific tick.
@@ -308,6 +314,11 @@ type Room struct {
 	rounds      map[string]*Round         // resource id -> open contention round
 	roundCount  map[string]int            // resource id -> rounds opened so far
 	roundEvents []RoundEvent              // drained by the journal after each tick
+	regionByID  map[string]*RegionSpec
+	resv        map[string]*Reservation
+	resvOrder   []string
+	resvInbox   []ResvEvent // intake ops applied at the next tick
+	resvEvents  []ResvEvent // derived verdicts, drained by the journal
 }
 
 func NewRoom(id string, cfg Config, chars []*Char) *Room {
@@ -316,6 +327,8 @@ func NewRoom(id string, cfg Config, chars []*Char) *Room {
 		byID: map[string]*Char{}, walls: map[[2]int]struct{}{}, sealed: map[[2]int]struct{}{},
 		resources: map[string]*ResourceState{}, outcomes: map[string]map[int64]bool{},
 		rounds: map[string]*Round{}, roundCount: map[string]int{},
+		regionByID: map[string]*RegionSpec{},
+		resv:       map[string]*Reservation{},
 	}
 	for _, c := range chars {
 		r.byID[c.ID] = c
@@ -335,6 +348,13 @@ func NewRoom(id string, cfg Config, chars []*Char) *Room {
 			ID: spec.ID, Name: spec.Name, Total: total, Remaining: total, Holders: []Holder{},
 		}
 		r.resOrder = append(r.resOrder, spec.ID)
+	}
+	for i := range cfg.Regions {
+		spec := cfg.Regions[i]
+		if spec.Capacity <= 0 {
+			spec.Capacity = 1
+		}
+		r.regionByID[spec.ID] = &spec
 	}
 	r.SetRules(DefaultRules())
 	return r
@@ -362,6 +382,11 @@ func DefaultConfig() Config {
 		Resources: []ResourceSpec{
 			{ID: "pass", Name: "通行名额", Total: 1},
 			{ID: "relic", Name: "场景遗物", Total: 1},
+		},
+		Regions: []RegionSpec{
+			{ID: "hall", Name: "中央大厅", Capacity: 2},
+			{ID: "garden", Name: "东侧花园", Capacity: 1},
+			{ID: "vault", Name: "地下宝库", Capacity: 1},
 		},
 	}
 }
@@ -414,6 +439,12 @@ func (r *Room) ApplyTickCtx(inputs []Input, postpones map[string]string) ([]Appl
 		}
 		r.adjudicate(rd, &applied)
 	}
+	// Group reservations: intake ops take effect at this tick boundary,
+	// then time-based transitions, then one deterministic adjudication
+	// boundary for everything still pending.
+	r.applyResvInbox()
+	r.advanceReservations()
+	r.adjudicateReservations()
 	for _, in := range inputs {
 		c := r.byID[in.CharID]
 		if c == nil || c.OwnerSession != in.SessionID {
@@ -724,6 +755,26 @@ func (r *Room) Snapshot() Snapshot {
 			s.Rounds = append(s.Rounds, roundStateOf(rd))
 		}
 	}
+	for _, spec := range r.Cfg.Regions {
+		rv := RegionView{ID: spec.ID, Name: spec.Name, Capacity: spec.Capacity, Occupants: []string{}}
+		if rv.Capacity <= 0 {
+			rv.Capacity = 1
+		}
+		for _, resID := range r.resvOrder {
+			res := r.resv[resID]
+			if !res.granted() || !containsString(res.Regions, spec.ID) {
+				continue
+			}
+			if res.Start <= r.Tick && r.Tick < res.effectiveEnd() {
+				rv.Used++
+				rv.Occupants = append(rv.Occupants, res.ID)
+			}
+		}
+		s.Regions = append(s.Regions, rv)
+	}
+	for _, resID := range r.resvOrder {
+		s.Reservations = append(s.Reservations, reservationViewOf(r.resv[resID]))
+	}
 	return s
 }
 
@@ -770,6 +821,8 @@ func (r *Room) DrainRoundEvents() []RoundEvent {
 // iteration order.
 func (s Snapshot) HashValue() string {
 	clone := Snapshot{Tick: s.Tick, Chars: s.Chars, Resources: s.Resources, Rounds: s.Rounds}
+	clone.Regions = s.Regions
+	clone.Reservations = s.Reservations
 	b, _ := json.Marshal(clone)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:16])
@@ -782,6 +835,7 @@ type JournalEvent struct {
 	Tick  *TickRecord
 	Rules *RulesRecord
 	Round *RoundEvent
+	Resv  *ResvEvent
 }
 
 // ReplayJournal rebuilds every snapshot purely from recorded events. The
@@ -793,7 +847,43 @@ func ReplayJournal(id string, cfg Config, initial []*Char, events []JournalEvent
 	out := make([]Snapshot, 0, len(events))
 	postpones := map[int64]map[string]string{}
 	var derivedRounds []RoundEvent
+	var derivedResv []ResvEvent
 	for _, ev := range events {
+		if ev.Resv != nil {
+			rev := ev.Resv
+			if rev.Op == "verdict" {
+				// Verdicts are derived by the engine at tick boundaries;
+				// the journaled record must match exactly.
+				if len(derivedResv) == 0 {
+					return nil, nil, fmt.Errorf("resv verdict %s/%s without derived counterpart", rev.ID, rev.State)
+				}
+				d := derivedResv[0]
+				derivedResv = derivedResv[1:]
+				if d.ID != rev.ID || d.State != rev.State || d.Tick != rev.Tick || d.Reason != rev.Reason ||
+					len(d.Conflicts) != len(rev.Conflicts) {
+					return nil, nil, fmt.Errorf("resv verdict diverged: journal %+v vs derived %+v", rev, d)
+				}
+				continue
+			}
+			// Intake ops take effect at the tick they were scheduled for.
+			if rev.Tick != r.Tick+1 {
+				return nil, nil, fmt.Errorf("resv op %s at tick %d, want %d", rev.Op, rev.Tick, r.Tick+1)
+			}
+			switch rev.Op {
+			case "submit":
+				if rev.Request == nil {
+					return nil, nil, fmt.Errorf("resv submit without request")
+				}
+				r.SubmitReservation(*rev.Request)
+			case "cancel":
+				r.CancelReservation(rev.ID)
+			case "return":
+				r.ReturnReservation(rev.ID)
+			default:
+				return nil, nil, fmt.Errorf("unknown resv op %q", rev.Op)
+			}
+			continue
+		}
 		if ev.Round != nil {
 			rev := ev.Round
 			if rev.State == "waiting" {
@@ -850,6 +940,7 @@ func ReplayJournal(id string, cfg Config, initial []*Char, events []JournalEvent
 		applied, snap := r.ApplyTickCtx(inputs, postpones[rec.Tick])
 		delete(postpones, rec.Tick)
 		derivedRounds = append(derivedRounds, r.DrainRoundEvents()...)
+		derivedResv = append(derivedResv, r.DrainResvEvents()...)
 		if len(applied) != len(rec.Inputs) {
 			return nil, nil, fmt.Errorf("tick %d replay diverged on input count", rec.Tick)
 		}

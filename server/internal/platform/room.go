@@ -254,6 +254,14 @@ func (ri *RoomInstance) runTick() {
 			err = err2
 		}
 	}
+	for _, rev := range ri.eng.DrainResvEvents() {
+		// Reservation verdicts are derived by the engine at the tick
+		// boundary and journaled right after the tick record so replay
+		// cross-checks them, exactly like contention-round events.
+		if err2 := ri.journal.Append(rev); err2 != nil && err == nil {
+			err = err2
+		}
+	}
 	ri.publishLocked(pubMsg{id: ri.nextEvtID, tick: snap.Tick, payload: payload})
 	ri.nextEvtID++
 	ri.mu.Unlock()
@@ -401,4 +409,54 @@ func (ri *RoomInstance) SwitchRules(sealed [][2]int, costs map[game.Command]int,
 	// Force a tick so the switch lands in the journal right away.
 	ri.runTick()
 	return next
+}
+
+// ReservationResult is returned for every reservation intake call.
+type ReservationResult struct {
+	Status      string                `json:"status"` // accepted | duplicate
+	Reservation *game.ReservationView `json:"reservation,omitempty"`
+}
+
+// submitReservation records an idempotent group reservation. The request
+// id is the durable identity: a duplicate submit (retry, reconnect,
+// replayed delivery) returns the existing state and never consumes
+// capacity a second time.
+func (ri *RoomInstance) submitReservation(req game.ReservationRequest) ReservationResult {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+	if ri.eng.ReservationKnown(req.ID) {
+		return ReservationResult{Status: "duplicate", Reservation: ri.eng.GetReservation(req.ID)}
+	}
+	ri.eng.SubmitReservation(req)
+	ev := game.ResvEvent{Type: "resv", Op: "submit", Tick: ri.eng.Tick + 1, Request: &req}
+	if err := ri.journal.Append(ev); err != nil {
+		panic(fmt.Errorf("room %s resv submit journal append: %w", ri.ID, err))
+	}
+	ri.lastActive = time.Now()
+	return ReservationResult{Status: "accepted", Reservation: ri.eng.GetReservation(req.ID)}
+}
+
+// reservationOp schedules a cancel or return for the next tick and
+// journals it with the tick it takes effect, so replay re-derives the
+// same state transitions. The engine decides at that tick whether the
+// op is still valid (a late cancel or duplicate return becomes an
+// explicit no-op verdict that cannot affect later grantees).
+func (ri *RoomInstance) reservationOp(op, id string) (*game.ReservationView, bool) {
+	ri.mu.Lock()
+	defer ri.mu.Unlock()
+	if ri.eng.GetReservation(id) == nil {
+		return nil, false
+	}
+	switch op {
+	case "cancel":
+		ri.eng.CancelReservation(id)
+	case "return":
+		ri.eng.ReturnReservation(id)
+	}
+	ev := game.ResvEvent{Type: "resv", Op: op, Tick: ri.eng.Tick + 1, ID: id}
+	if err := ri.journal.Append(ev); err != nil {
+		panic(fmt.Errorf("room %s resv %s journal append: %w", ri.ID, op, err))
+	}
+	ri.lastActive = time.Now()
+	return ri.eng.GetReservation(id), true
 }

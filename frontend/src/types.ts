@@ -49,7 +49,7 @@ export interface SessionInfo {
 
 export interface RoomInfo {
 	roomId: string;
-	config: { width: number; height: number; obstacles: [number, number][] };
+	config: { width: number; height: number; obstacles: [number, number][]; regions?: RegionSpec[] };
 	chars: CharMeta[];
 	sessions: SessionInfo[];
 	rules: Rules;
@@ -78,7 +78,64 @@ export interface Snapshot {
 	chars: CharState[];
 	resources?: ResourceState[];
 	rounds?: RoundState[];
+	regions?: RegionView[];
+	reservations?: ReservationView[];
 	hash: string;
+}
+
+// A bookable region declared by the room config.
+export interface RegionSpec {
+	id: string;
+	name: string;
+	capacity: number;
+}
+
+// Live occupancy of one region (from the authoritative snapshot).
+export interface RegionView {
+	id: string;
+	name: string;
+	capacity: number;
+	used: number;
+	occupants: string[];
+}
+
+// One concrete interval blocking a pending group reservation.
+export interface ConflictInterval {
+	kind: 'region' | 'char';
+	id: string;
+	start: number;
+	end: number;
+	by: string;
+}
+
+export type ReservationState =
+	| 'pending'
+	| 'approved'
+	| 'active'
+	| 'completed'
+	| 'released'
+	| 'cancelled'
+	| 'rejected';
+
+// The authoritative view of one group reservation request.
+export interface ReservationView {
+	id: string;
+	chars: string[];
+	regions: string[];
+	start: number;
+	end: number;
+	priority: number;
+	submitTick: number;
+	state: ReservationState;
+	reason?: string;
+	conflicts?: ConflictInterval[];
+	windowsWaited?: number;
+	returnedTick?: number;
+}
+
+export interface ReservationResult {
+	status: 'accepted' | 'duplicate';
+	reservation?: ReservationView;
 }
 
 export interface AppliedInput {

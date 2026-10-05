@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { changeRules, createRoom, resumeRoom, runReplay, type ChaosConfig, defaultChaos } from './api';
 import { ClientPanel } from './ClientPanel';
+import { ReservationPanel } from './ReservationPanel';
 import type { Command, ReplayResult, RoomInfo } from './types';
 
 // Demo rule presets: seal a corridor and/or raise movement cost.
@@ -182,6 +183,8 @@ export default function App() {
 				<ClientPanel key={`${room.roomId}:0`} room={room} sessionIndex={0} chaos={chaos} duplicateSeen={(t) => pushLog(t, 'warn')} />
 				<ClientPanel key={`${room.roomId}:1`} room={room} sessionIndex={1} chaos={chaos} duplicateSeen={(t) => pushLog(t, 'warn')} />
 			</section>
+
+			<ReservationPanel room={room} onLog={pushLog} />
 
 			<section className="journal">
 				<h3>客户端事件 / 网络异常日志</h3>

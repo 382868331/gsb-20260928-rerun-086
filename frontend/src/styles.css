@@ -181,3 +181,29 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 	gap: 4px;
 	font-size: 12px;
 }
+
+/* Multi-region group reservation board */
+.resv { margin: 12px 0; padding: 12px; border: 1px solid #334155; border-radius: 8px; }
+.resv h3 { margin: 0 0 8px; }
+.resv-layout { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+.resv-form { min-width: 320px; }
+.resv-row { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+.resv-row input[type='number'] { width: 64px; }
+.resv-regions { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.resv-region { display: flex; gap: 8px; align-items: center; }
+.resv-region-name { min-width: 72px; }
+.resv-bar { display: inline-flex; gap: 3px; }
+.resv-bar .slot { display: inline-block; width: 16px; height: 10px; border: 1px solid #475569; border-radius: 2px; }
+.resv-bar .slot.used { background: #38bdf8; border-color: #38bdf8; }
+.resv-list { flex: 1; min-width: 360px; display: flex; flex-direction: column; gap: 8px; }
+.resv-card { border: 1px solid #334155; border-radius: 6px; padding: 8px 10px; }
+.resv-card-head { display: flex; gap: 8px; align-items: center; margin-bottom: 4px; }
+.resv-card-head button { margin-left: auto; }
+.phase { padding: 1px 8px; border-radius: 10px; font-size: 12px; background: #475569; }
+.phase-pending { background: #a16207; }
+.phase-approved { background: #0369a1; }
+.phase-active { background: #15803d; }
+.phase-completed, .phase-released { background: #475569; }
+.phase-cancelled, .phase-rejected { background: #7f1d1d; }
+.resv-conflicts { margin: 4px 0 0; padding-left: 18px; font-size: 12px; color: #fbbf24; }
+.warn-text { color: #fbbf24; }

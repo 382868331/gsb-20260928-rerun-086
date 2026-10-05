@@ -1,4 +1,4 @@
-import type { Command, EnqueueResult, ReplayResult, RoomInfo, Rules, SnapshotEvent } from './types';
+import type { Command, EnqueueResult, ReplayResult, ReservationResult, RoomInfo, Rules, SnapshotEvent } from './types';
 
 export interface ChaosConfig {
 	// Delay range (ms) applied to every POST before it leaves the client.
@@ -201,4 +201,49 @@ export async function changeRules(
 	});
 	if (!resp.ok) throw new Error(`rules switch failed: ${resp.status}`);
 	return (await resp.json()) as Rules;
+}
+
+// submitReservation sends an idempotent multi-region group reservation.
+// The requestId is generated once per request and reused on retries, so
+// duplicate submissions never consume capacity twice.
+export async function submitReservation(
+	roomId: string,
+	body: {
+		sessionId: string;
+		requestId: string;
+		chars: string[];
+		regions: string[];
+		start: number;
+		end: number;
+		priority: number;
+	},
+): Promise<{ status: number; result: ReservationResult | null }> {
+	const resp = await fetch(`/api/rooms/${roomId}/reservations`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(body),
+	});
+	let json: unknown = null;
+	try {
+		json = await resp.json();
+	} catch {
+		// non-JSON response
+	}
+	return { status: resp.status, result: json as ReservationResult };
+}
+
+// reservationOp cancels (before start) or returns (early release of the
+// remaining window) a reservation.
+export async function reservationOp(
+	roomId: string,
+	requestId: string,
+	op: 'cancel' | 'return',
+	sessionId: string,
+): Promise<number> {
+	const resp = await fetch(`/api/rooms/${roomId}/reservations/${requestId}/${op}`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ sessionId }),
+	});
+	return resp.status;
 }
